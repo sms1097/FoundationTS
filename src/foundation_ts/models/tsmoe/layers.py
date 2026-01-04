@@ -1,9 +1,15 @@
 from __future__ import annotations
+import math
 
 import torch
 from torch import nn
 
 from foundation_ts.models.tsmoe.stats import MoEStats
+
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
 
 
 class RMSNorm(nn.Module):
@@ -94,7 +100,8 @@ class Attention(nn.Module):
         # hidden_state: (B, T, D)
         B, T, _ = hidden_state.shape
 
-        qkv = self.qkv_proj(hidden_state).contiguous().view(B, T, self.num_heads, 3 * self.head_dim)
+        qkv = self.qkv_proj(hidden_state)
+        qkv = qkv.contiguous().view(B, T, self.num_heads, 3 * self.head_dim)
         qkv = qkv.swapaxes(1, 2)
 
         q = qkv[..., : self.head_dim]
@@ -109,9 +116,33 @@ class Attention(nn.Module):
             if key_padding.any():
                 attn_mask = key_padding[:, None, None, :]
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=True
+        causal_mask = torch.triu(
+            torch.ones((T, T), device=q.device, dtype=torch.bool), diagonal=1
         )
+        if attn_mask is None:
+            combined_mask = causal_mask
+        else:
+            combined_mask = attn_mask | causal_mask[None, None, :, :]
+
+        # SDPA path with explicit combined mask (padding + causal)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=combined_mask,
+            is_causal=False,
+            # , scale=0.5 / math.sqrt(self.head_dim)
+        )
+        # Manual path (kept for reference/testing):
+        # scale = 1.0 / (self.head_dim**0.5)
+        # scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # if attn_mask is not None:
+        #     scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+        # scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
+        # attn = torch.softmax(scores, dim=-1)
+        # _ensure_finite("attention.softmax", attn)
+        # out = torch.matmul(attn, v)
+        # _ensure_finite("attention.sdpa", out)
 
         out = out.swapaxes(1, 2)
         out = self.out_proj(out.flatten(-2, -1))
@@ -180,7 +211,7 @@ class MOELayer(nn.Module):
         expert_for_route = topk_idx.reshape(M)
         gate_for_route = topk_vals.reshape(M)
 
-        token_ids = torch.arange(N)
+        token_ids = torch.arange(N, device=hidden_state.device)
         token_for_route = token_ids.repeat_interleave(self.k)
 
         # actually group by expert
@@ -211,7 +242,9 @@ class MOELayer(nn.Module):
         y_out.scatter_add_(0, index=token_sorted.unsqueeze(-1).expand(-1, D), src=y_sorted)
         y_out = y_out.reshape(B, T, D)
 
-        y_out = y_out + shared_expert_score * self.shared_expert(hidden_state)
+        shared_out = self.shared_expert(hidden_state)
+
+        y_out = y_out + shared_expert_score * shared_out
 
         # aux loss specifics
         counts = counts.float()

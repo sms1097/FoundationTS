@@ -114,7 +114,7 @@ class TSMOE(nn.Module):
         hidden_state = self.embed_layer(x)
 
         stats = MoEStats.zeros(self.num_experts, x.device)
-        for dl in self.decoder_layers:
+        for idx, dl in enumerate(self.decoder_layers):
             hidden_state, stats = dl(hidden_state, stats, attention_mask=attention_mask)
 
         out = self.output_layer(hidden_state)

@@ -46,6 +46,7 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--aux-loss-weight", type=float, default=0.02)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int, default=10_000)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-split", type=float, default=0.01)
@@ -108,6 +109,7 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         beta1=args.beta1,
         beta2=args.beta2,
         aux_loss_weight=args.aux_loss_weight,
+        max_grad_norm=args.max_grad_norm,
         warmup_steps=args.warmup_steps,
         grad_accum_steps=args.grad_accum_steps,
         device=args.device,

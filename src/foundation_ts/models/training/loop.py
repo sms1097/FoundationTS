@@ -17,6 +17,9 @@ from foundation_ts.models.training.utils import (
     aux_loss,
 )
 from foundation_ts.models.tsmoe import TSMOE
+from foundation_ts.models.tsmoe.layers import MOELayer
+
+# torch.autograd.set_detect_anomaly(True)
 
 
 def _get_device(device: str | None) -> torch.device:
@@ -241,6 +244,7 @@ def _log_training_step(
     avg_aux: float,
     lr: float,
     toks_per_sec: float,
+    mem_stats: dict[str, float] | None,
 ) -> None:
     if writer is None:
         return
@@ -249,6 +253,8 @@ def _log_training_step(
     writer.add_scalar("train/aux_loss", avg_aux, global_step)
     writer.add_scalar("train/lr", lr, global_step)
     writer.add_scalar("train/toks_per_sec", toks_per_sec, global_step)
+    if mem_stats:
+        _log_cuda_memory(writer, global_step, mem_stats)
 
 
 def _log_validation(
@@ -266,6 +272,125 @@ def _log_validation(
     writer.add_scalar(f"{prefix}/aux_loss", aux, global_step)
     writer.add_scalar(f"{prefix}/mae", mae, global_step)
     writer.add_scalar(f"{prefix}/mse", mse, global_step)
+
+
+def _format_param_count(value: int) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}K"
+    return str(value)
+
+
+def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
+    total_params = sum(p.numel() for p in model.parameters())
+    expert_params = 0
+    active_expert_params = 0.0
+    for module in model.modules():
+        if isinstance(module, MOELayer):
+            layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
+            expert_params += layer_expert_params
+            if module.num_experts:
+                active_expert_params += layer_expert_params * (module.k / module.num_experts)
+    active_params = int(round(total_params - expert_params + active_expert_params))
+    return total_params, active_params
+
+
+def _bytes_to_mib(value: float) -> float:
+    return value / (1024.0 * 1024.0)
+
+
+def _format_cuda_memory(mem_stats: dict[str, float]) -> str:
+    alloc_cur = _bytes_to_mib(mem_stats["allocated_current"])
+    alloc_peak = _bytes_to_mib(mem_stats["allocated_peak"])
+    alloc_min = _bytes_to_mib(mem_stats["allocated_min"])
+    alloc_max = _bytes_to_mib(mem_stats["allocated_max"])
+    res_cur = _bytes_to_mib(mem_stats["reserved_current"])
+    res_peak = _bytes_to_mib(mem_stats["reserved_peak"])
+    res_min = _bytes_to_mib(mem_stats["reserved_min"])
+    res_max = _bytes_to_mib(mem_stats["reserved_max"])
+    active_cur = _bytes_to_mib(mem_stats["active_current"])
+    active_peak = _bytes_to_mib(mem_stats["active_peak"])
+    extras = []
+    if mem_stats["alloc_retries"] > 0:
+        extras.append(f"alloc_retries={int(mem_stats['alloc_retries'])}")
+    if mem_stats["ooms"] > 0:
+        extras.append(f"ooms={int(mem_stats['ooms'])}")
+    extra_str = f" {' '.join(extras)}" if extras else ""
+    return (
+        "gpu_mem(MiB) "
+        f"alloc={alloc_cur:.0f}/{alloc_peak:.0f} min/max={alloc_min:.0f}/{alloc_max:.0f} "
+        f"res={res_cur:.0f}/{res_peak:.0f} min/max={res_min:.0f}/{res_max:.0f} "
+        f"active={active_cur:.0f}/{active_peak:.0f}{extra_str}"
+    )
+
+
+def _log_cuda_memory(writer: SummaryWriter, global_step: int, mem_stats: dict[str, float]) -> None:
+    writer.add_scalar(
+        "memory/allocated_current_mb", _bytes_to_mib(mem_stats["allocated_current"]), global_step
+    )
+    writer.add_scalar("memory/allocated_peak_mb", _bytes_to_mib(mem_stats["allocated_peak"]), global_step)
+    writer.add_scalar("memory/allocated_min_mb", _bytes_to_mib(mem_stats["allocated_min"]), global_step)
+    writer.add_scalar("memory/allocated_max_mb", _bytes_to_mib(mem_stats["allocated_max"]), global_step)
+    writer.add_scalar("memory/reserved_current_mb", _bytes_to_mib(mem_stats["reserved_current"]), global_step)
+    writer.add_scalar("memory/reserved_peak_mb", _bytes_to_mib(mem_stats["reserved_peak"]), global_step)
+    writer.add_scalar("memory/reserved_min_mb", _bytes_to_mib(mem_stats["reserved_min"]), global_step)
+    writer.add_scalar("memory/reserved_max_mb", _bytes_to_mib(mem_stats["reserved_max"]), global_step)
+    writer.add_scalar("memory/active_current_mb", _bytes_to_mib(mem_stats["active_current"]), global_step)
+    writer.add_scalar("memory/active_peak_mb", _bytes_to_mib(mem_stats["active_peak"]), global_step)
+    writer.add_scalar("memory/alloc_retries", mem_stats["alloc_retries"], global_step)
+    writer.add_scalar("memory/ooms", mem_stats["ooms"], global_step)
+
+
+class _CudaMemoryTracker:
+    def __init__(self, device: torch.device, enabled: bool) -> None:
+        self.device = device
+        self.enabled = enabled and device.type == "cuda"
+        self.reset_interval()
+
+    def reset_interval(self) -> None:
+        if not self.enabled:
+            return
+        self.min_allocated = None
+        self.max_allocated = 0.0
+        self.min_reserved = None
+        self.max_reserved = 0.0
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def update(self) -> None:
+        if not self.enabled:
+            return
+        allocated = float(torch.cuda.memory_allocated(self.device))
+        reserved = float(torch.cuda.memory_reserved(self.device))
+        if self.min_allocated is None or allocated < self.min_allocated:
+            self.min_allocated = allocated
+        if self.min_reserved is None or reserved < self.min_reserved:
+            self.min_reserved = reserved
+        if allocated > self.max_allocated:
+            self.max_allocated = allocated
+        if reserved > self.max_reserved:
+            self.max_reserved = reserved
+
+    def snapshot(self) -> dict[str, float] | None:
+        if not self.enabled:
+            return None
+        stats = torch.cuda.memory_stats(self.device)
+        return {
+            "allocated_current": float(stats.get("allocated_bytes.all.current", 0.0)),
+            "allocated_peak": float(stats.get("allocated_bytes.all.peak", 0.0)),
+            "allocated_min": float(self.min_allocated or 0.0),
+            "allocated_max": float(self.max_allocated),
+            "reserved_current": float(stats.get("reserved_bytes.all.current", 0.0)),
+            "reserved_peak": float(stats.get("reserved_bytes.all.peak", 0.0)),
+            "reserved_min": float(self.min_reserved or 0.0),
+            "reserved_max": float(self.max_reserved),
+            "active_current": float(stats.get("active_bytes.all.current", 0.0)),
+            "active_peak": float(stats.get("active_bytes.all.peak", 0.0)),
+            "alloc_retries": float(stats.get("num_alloc_retries", 0.0)),
+            "ooms": float(stats.get("num_ooms", 0.0)),
+        }
 
 
 def _train_microbatches(
@@ -317,6 +442,8 @@ def _train_microbatches(
     return accum_total, accum_pred, accum_aux, accum_tokens, data_iter
 
 
+
+
 def train(config: RunnerConfig) -> TSMOE:
     loss_fn = torch.nn.HuberLoss(reduction="none", delta=2.0)
 
@@ -333,6 +460,13 @@ def train(config: RunnerConfig) -> TSMOE:
 
     total_steps = train_config.epochs * train_config.steps_per_epoch
 
+    total_params, active_params = _estimate_active_params(model)
+    print(
+        "params "
+        f"total={_format_param_count(total_params)} ({total_params:,}) "
+        f"active={_format_param_count(active_params)} ({active_params:,})"
+    )
+
     model.train()
     checkpoint_dir = Path(train_config.checkpoint_dir)
     last_log_time = time.time()
@@ -348,6 +482,14 @@ def train(config: RunnerConfig) -> TSMOE:
     accum_steps = max(1, train_config.grad_accum_steps)
     use_amp = train_config.use_amp and train_config.use_bf16 and device.type == "cuda"
     autocast_dtype = torch.bfloat16 if use_amp else None
+    mem_logging_enabled = bool(
+        device.type == "cuda"
+        and (
+            train_config.log_gpu_memory_stdout
+            or (writer is not None and train_config.log_gpu_memory_tensorboard)
+        )
+    )
+    mem_tracker = _CudaMemoryTracker(device, mem_logging_enabled)
 
     data_iter = iter(data_loader)
     for step_idx in range(start_step, total_steps):
@@ -370,6 +512,7 @@ def train(config: RunnerConfig) -> TSMOE:
         scheduler.step()
         global_step = step_idx + 1
         tokens_since_log += accum_tokens
+        mem_tracker.update()
 
         avg_total = accum_total / accum_steps
         avg_pred = accum_pred / accum_steps
@@ -380,14 +523,30 @@ def train(config: RunnerConfig) -> TSMOE:
             elapsed = max(1e-6, now - last_log_time)
             toks_per_sec = tokens_since_log / elapsed
             lr = optimizer.param_groups[0]["lr"]
+            mem_stats = mem_tracker.snapshot() if mem_logging_enabled else None
+            mem_str = (
+                f" {_format_cuda_memory(mem_stats)}"
+                if mem_stats and train_config.log_gpu_memory_stdout
+                else ""
+            )
             print(
                 f"step={global_step} loss={avg_total:.4f} "
                 f"pred={avg_pred:.4f} aux={avg_aux:.4f} "
-                f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}"
+                f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{mem_str}"
             )
-            _log_training_step(writer, global_step, avg_total, avg_pred, avg_aux, lr, toks_per_sec)
+            _log_training_step(
+                writer,
+                global_step,
+                avg_total,
+                avg_pred,
+                avg_aux,
+                lr,
+                toks_per_sec,
+                mem_stats if train_config.log_gpu_memory_tensorboard else None,
+            )
             last_log_time = now
             tokens_since_log = 0
+            mem_tracker.reset_interval()
 
         if train_config.val_every and global_step % train_config.val_every == 0:
             if val_loader is not None:
