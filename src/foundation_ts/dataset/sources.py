@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import warnings
 from collections import OrderedDict
 from typing import Callable, Optional
@@ -94,6 +95,7 @@ class BinarySequenceDataset(torch.utils.data.Dataset):
         """Initialize from a shard directory and optional post-transform."""
         if not self.is_valid_path(data_path):
             raise ValueError(f"Folder {data_path} is not a valid dataset.")
+        _validate_shard_filenames(data_path)
 
         self.data_path = data_path
         self.transform = transform
@@ -208,6 +210,21 @@ class BinarySequenceDataset(torch.utils.data.Dataset):
                 if os.path.isfile(os.path.join(data_path, sub)) and sub.endswith(".bin"):
                     return True
         return False
+
+
+def _validate_shard_filenames(data_path: str) -> None:
+    """Ensure all shard files match <prefix>-i-of-n.bin to avoid ambiguous ordering."""
+    shard_re = re.compile(r"^[a-zA-Z0-9_]+-\d+-of-\d+\.bin$")
+    bad = []
+    for name in os.listdir(data_path):
+        if name.endswith(".bin") and not shard_re.match(name):
+            bad.append(name)
+    if bad:
+        bad_list = ", ".join(sorted(bad))
+        raise ValueError(
+            "Shard filenames must match <prefix>-i-of-n.bin; "
+            f"invalid shard(s): {bad_list}"
+        )
 
 
 def discover_sequence_datasets(

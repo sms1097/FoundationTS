@@ -52,6 +52,7 @@ class WindowedDataset(torch.utils.data.Dataset):
         seq = self.dataset[dataset_idx]
         seq = seq[offset : offset + self.window_size_plus_one].to(torch.float32)
 
+        # TODO: Implement packing here
         seq_len = len(seq)
         if seq_len == self.window_size_plus_one:
             loss_mask = torch.ones(self.window_size, dtype=torch.int32)

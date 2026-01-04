@@ -22,9 +22,7 @@ class ConcatSequenceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, seq_idx: int) -> torch.Tensor:
         if seq_idx >= self.cumsum_lengths[-1]:
-            raise ValueError(
-                f"Index out of the dataset length: {seq_idx} >= {self.cumsum_lengths[-1]}"
-            )
+            raise ValueError(f"Index out of the dataset length: {seq_idx} >= {self.cumsum_lengths[-1]}")
         if seq_idx < 0:
             raise ValueError(f"Index out of the dataset length: {seq_idx} < 0")
 
@@ -35,9 +33,7 @@ class ConcatSequenceDataset(torch.utils.data.Dataset):
     def get_sequence_length_by_idx(self, seq_idx: int) -> int:
         """Return the length of a single sequence."""
         if seq_idx >= self.cumsum_lengths[-1]:
-            raise ValueError(
-                f"Index out of the dataset length: {seq_idx} >= {self.cumsum_lengths[-1]}"
-            )
+            raise ValueError(f"Index out of the dataset length: {seq_idx} >= {self.cumsum_lengths[-1]}")
         if seq_idx < 0:
             raise ValueError(f"Index out of the dataset length: {seq_idx} < 0")
 

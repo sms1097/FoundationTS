@@ -152,50 +152,12 @@ If you want a ready-made dataset, use the script in this folder to pull the
 Time-300B partitions used in the benchmarks.
 
 ```bash
-python data/download_data.py
+foundationts data download
 ```
 
 This downloads into `time300b_selected/` by default. The script uses
 `huggingface_hub.snapshot_download`, so you may need to set your HF token in
 the environment (e.g., `HUGGINGFACE_HUB_TOKEN`) if required by your setup.
-
-### Getting started: (Optional) convert your data to .bin
-
-The converter expects a file (or folder of files) with sequences. Each sequence
-is a 1D list/array of numeric values. If a sequence is stored as a dict, the
-loader expects a `sequence` key and optional `meta` with `mean`/`std`.
-
-Example JSON input (list of dicts):
-
-```json
-[
-  {
-    "id": "series-1",
-    "sequence": [10, 11, 12],
-    "meta": { "mean": 10.5, "std": 1.0 }
-  },
-  { "id": "series-2", "sequence": [20, 21, 22, 23] }
-]
-```
-
-Convert a single file:
-
-```bash
-python data/convert_dataset_to_bin.py \
-  --input data/my_sequences.json \
-  --output data/my_sequences_bin
-```
-
-Convert a folder (recursively scans .jsonl/.npy/.npy.gz/.pkl files):
-
-```bash
-python data/convert_dataset_to_bin.py \
-  --input data/raw_sequences \
-  --output data/binarized
-```
-
-The output is a `meta.json` plus one or more `data-*-of-*.bin` shards. For
-details on the binary format, see the “Binary shard datasets” section above.
 
 Loading data and adding scalers
 The loader can ingest either a single dataset file, a binary dataset folder,

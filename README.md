@@ -30,6 +30,48 @@ sample = ds[0]
 print(sample["input_ids"].shape, sample["labels"].shape, sample["loss_masks"].shape)
 ```
 
+## Setup and running
+
+Install dependencies (editable):
+
+```bash
+pip install -e .
+```
+
+Download a dataset (pick one option):
+
+Time-300B partitions (default downloader):
+
+```bash
+foundationts data download
+```
+
+Time-300B debug partitions:
+
+```bash
+foundationts data download --partition-set debug
+```
+
+Train a model:
+
+```bash
+foundationts train \
+  --dataset-path time300b_selected \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 256 \
+  --n-decoder-layers 4
+```
+
+Train with an out-of-distribution validation dataset (finance):
+
+```bash
+foundationts train \
+  --dataset-path time300b_selected \
+  --ood-val-dataset-path time300b_selected/finance \
+  --val-split 0.01
+```
+
 Custom usage
 
 ```python
@@ -49,7 +91,7 @@ See `docs/data.md` for the on-disk sequence formats.
 
 Docs
 
-- `docs/data.md`: data formats, conversion, download, scalers, and windowing
+- `docs/data.md`: data formats, download, scalers, and windowing
 
 ### Attribution
 
