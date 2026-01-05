@@ -221,10 +221,7 @@ def _validate_shard_filenames(data_path: str) -> None:
             bad.append(name)
     if bad:
         bad_list = ", ".join(sorted(bad))
-        raise ValueError(
-            "Shard filenames must match <prefix>-i-of-n.bin; "
-            f"invalid shard(s): {bad_list}"
-        )
+        raise ValueError(f"Shard filenames must match <prefix>-i-of-n.bin; invalid shard(s): {bad_list}")
 
 
 def discover_sequence_datasets(

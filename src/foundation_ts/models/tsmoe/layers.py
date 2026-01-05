@@ -1,15 +1,15 @@
 from __future__ import annotations
-import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from foundation_ts.models.tsmoe.stats import MoEStats
 
-torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
-
+torch.set_float32_matmul_precision("high")
 
 
 class RMSNorm(nn.Module):
@@ -17,12 +17,13 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
+        self.normalized_shape = (hidden_size,)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        # accumulate in FP32 to avoid overflow/accuracy loss
-        denom = torch.rsqrt(hidden_state.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        out = hidden_state * denom * self.weight
-        return out
+        # weight = self.weight
+        # if weight.dtype != hidden_state.dtype:
+        #     weight = weight.to(hidden_state.dtype)
+        return F.rms_norm(hidden_state, self.normalized_shape, self.weight.to(hidden_state.dtype), self.eps)
 
 
 def rotate_half(x):
@@ -49,7 +50,7 @@ class RotaryEmbedding(torch.nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         inv_freq = 1.0 / (
-            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim)
+            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).to(device) / self.dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -72,12 +73,19 @@ class RotaryEmbedding(torch.nn.Module):
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
+        if seq_len is None:
+            seq_len = x.shape[-2]
+
+        if (
+            seq_len > self.max_seq_len_cached
+            or self.cos_cached.device != x.device
+            or self.cos_cached.dtype != x.dtype
+        ):
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
+            self.cos_cached[:seq_len],
+            self.sin_cached[:seq_len],
         )
 
 
@@ -116,9 +124,7 @@ class Attention(nn.Module):
             if key_padding.any():
                 attn_mask = key_padding[:, None, None, :]
 
-        causal_mask = torch.triu(
-            torch.ones((T, T), device=q.device, dtype=torch.bool), diagonal=1
-        )
+        causal_mask = torch.triu(torch.ones((T, T), device=q.device, dtype=torch.bool), diagonal=1)
         if attn_mask is None:
             combined_mask = causal_mask
         else:
@@ -242,27 +248,26 @@ class MOELayer(nn.Module):
         y_out.scatter_add_(0, index=token_sorted.unsqueeze(-1).expand(-1, D), src=y_sorted)
         y_out = y_out.reshape(B, T, D)
 
-        shared_out = self.shared_expert(hidden_state)
+        shared_in = hidden_state.reshape(N, D)
+        shared_out = self.shared_expert(shared_in).reshape(B, T, D)
 
         y_out = y_out + shared_expert_score * shared_out
 
         # aux loss specifics
-        counts = counts.float()
         if attention_mask is None:
             load = counts / (counts.sum() + 1e-12)  # (N,)
-            importance = router_scores.mean(dim=(0, 1)).float()
+            importance = router_scores.mean(dim=(0, 1))
+            # importance = router_scores.mean(dim=(0, 1))
         else:
-            flat_mask = attention_mask.reshape(N).to(device=router_scores.device, dtype=router_scores.dtype)
-            denom = flat_mask.sum().clamp(min=1.0)
+            flat_mask = attention_mask.reshape(N).to(device=router_scores.device)
+            denom = flat_mask.sum() + 1e-12
             importance = (router_scores * flat_mask.view(B, T, 1)).sum(dim=(0, 1)) / denom
-            route_valid = flat_mask.repeat_interleave(self.k).to(torch.bool)
+            route_valid = flat_mask.repeat_interleave(self.k) > 0
             if route_valid.any():
-                masked_counts = torch.bincount(
-                    expert_for_route[route_valid], minlength=self.num_experts
-                ).float()
-                load = masked_counts / masked_counts.sum().clamp(min=1.0)
+                masked_counts = torch.bincount(expert_for_route[route_valid], minlength=self.num_experts)
+                load = masked_counts / (masked_counts.sum() + 1e-12)
             else:
-                load = torch.zeros_like(counts)
+                load = torch.zeros(self.num_experts, device=counts.device, dtype=router_scores.dtype)
 
         stats.add_values_(importance, load)
 

@@ -1,6 +1,9 @@
+import math
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
+import shutil
 
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -11,6 +14,7 @@ from foundation_ts.models.training.config import RunnerConfig
 from foundation_ts.models.training.utils import (
     _build_attention_mask,
     _build_horizon_targets,
+    _patch_labels_and_masks,
     _forecast_loss,
     _prepare_batch,
     _set_seed,
@@ -18,8 +22,6 @@ from foundation_ts.models.training.utils import (
 )
 from foundation_ts.models.tsmoe import TSMOE
 from foundation_ts.models.tsmoe.layers import MOELayer
-
-# torch.autograd.set_detect_anomaly(True)
 
 
 def _get_device(device: str | None) -> torch.device:
@@ -110,6 +112,12 @@ def _build_model(model_config, device: torch.device) -> TSMOE:
     return model
 
 
+def _maybe_compile_model(model, train_config):
+    if not train_config.compile:
+        return model
+    return torch.compile(model)
+
+
 def _build_optimizer_scheduler(
     model: TSMOE, train_config, device: torch.device
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
@@ -127,7 +135,7 @@ def _build_optimizer_scheduler(
         if step < train_config.warmup_steps:
             return step / max(1, train_config.warmup_steps)
         progress = (step - train_config.warmup_steps) / max(1, total_steps - train_config.warmup_steps)
-        return 0.5 * (1.0 + torch.cos(torch.tensor(progress) * torch.pi)).item()
+        return 0.5 * (1.0 + math.cos(progress * math.pi))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -181,6 +189,61 @@ def _save_checkpoint(
     )
 
 
+def _build_profiler(train_config, device: torch.device, checkpoint_dir: Path):
+    if not train_config.profile:
+        return None
+    profile_wait = 10
+    profile_warmup = 10
+    profile_active = 1
+    profile_repeat = 1
+    profile_dir = (
+        Path(train_config.profile_dir)
+        if train_config.profile_dir
+        else checkpoint_dir / "profiler"
+    )
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    schedule = torch.profiler.schedule(
+        wait=profile_wait,
+        warmup=profile_warmup,
+        active=profile_active,
+        repeat=profile_repeat,
+    )
+    trace_handler = torch.profiler.tensorboard_trace_handler(str(profile_dir))
+    chrome_trace_path = profile_dir / "chrome_trace.json"
+    exported = False
+
+    def _latest_trace_file() -> Path | None:
+        candidates = list(profile_dir.rglob("*.pt.trace.json"))
+        candidates += [p for p in profile_dir.rglob("*trace.json") if p.name != chrome_trace_path.name]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def on_trace_ready(prof: torch.profiler.profile) -> None:
+        nonlocal exported
+        trace_handler(prof)
+        if exported:
+            return
+        latest = _latest_trace_file()
+        if latest is None:
+            return
+        shutil.copy2(latest, chrome_trace_path)
+        exported = True
+
+    profiler = torch.profiler.profile(
+        activities=activities,
+        schedule=schedule,
+        on_trace_ready=on_trace_ready,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    )
+    return profiler
+
+
 @torch.no_grad()
 def _run_validation(
     model: TSMOE,
@@ -195,11 +258,11 @@ def _run_validation(
     use_amp: bool = True,
 ) -> tuple[float, float, float, float]:
     model.eval()
-    total_pred = 0.0
-    total_aux = 0.0
-    total_mae = 0.0
-    total_mse = 0.0
-    total_count = 0.0
+    total_pred = torch.zeros((), device=device)
+    total_aux = torch.zeros((), device=device)
+    total_mae = torch.zeros((), device=device)
+    total_mse = torch.zeros((), device=device)
+    total_count = torch.zeros((), device=device)
     count = 0
     for batch in val_loader:
         input_ids, labels, loss_masks = _prepare_batch(batch, device)
@@ -211,20 +274,38 @@ def _run_validation(
 
         if autocast_dtype is None:
             outputs, stats = model(input_ids, attention_mask=attention_mask)
-            pred_loss = _forecast_loss(outputs, labels, loss_masks, loss_fn)
+            pred_loss = _forecast_loss(
+                outputs,
+                labels,
+                loss_masks,
+                loss_fn,
+                patch=patch,
+                patch_len=patch_len,
+                patch_stride=patch_stride,
+            )
         else:
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                 outputs, stats = model(input_ids, attention_mask=attention_mask)
-                pred_loss = _forecast_loss(outputs, labels, loss_masks, loss_fn)
+                pred_loss = _forecast_loss(
+                    outputs,
+                    labels,
+                    loss_masks,
+                    loss_fn,
+                    patch=patch,
+                    patch_len=patch_len,
+                    patch_stride=patch_stride,
+                )
 
-        total_pred += pred_loss.item()
-        total_aux += aux_loss(stats).item()
+        total_pred += pred_loss.detach()
+        total_aux += aux_loss(stats).detach()
+        if patch:
+            labels, loss_masks = _patch_labels_and_masks(labels, loss_masks, patch_len, patch_stride)
         for horizon, preds in outputs.items():
             targets, masks = _build_horizon_targets(labels, loss_masks, horizon)
             diff = (preds - targets) * masks
-            total_mae += diff.abs().sum().item()
-            total_mse += (diff**2).sum().item()
-            total_count += masks.sum().item()
+            total_mae += diff.abs().sum()
+            total_mse += (diff**2).sum()
+            total_count += masks.sum()
         count += 1
         if count >= max_batches:
             break
@@ -232,8 +313,19 @@ def _run_validation(
     model.train()
     if count == 0:
         return 0.0, 0.0, 0.0, 0.0
-    denom = max(1.0, total_count)
-    return total_pred / count, total_aux / count, total_mae / denom, total_mse / denom
+    if isinstance(total_count, torch.Tensor):
+        total_pred = total_pred.detach().cpu()
+        total_aux = total_aux.detach().cpu()
+        total_mae = total_mae.detach().cpu()
+        total_mse = total_mse.detach().cpu()
+        total_count = total_count.detach().cpu()
+    denom = max(1.0, float(total_count))
+    return (
+        float(total_pred) / count,
+        float(total_aux) / count,
+        float(total_mae) / denom,
+        float(total_mse) / denom,
+    )
 
 
 def _log_training_step(
@@ -403,17 +495,23 @@ def _train_microbatches(
     accum_steps: int,
     autocast_dtype,
     aux_weight: float,
-) -> tuple[float, float, float, int, object]:
-    accum_total = 0.0
-    accum_pred = 0.0
-    accum_aux = 0.0
+    log_timers: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float, float, object]:
+    accum_total = torch.zeros((), device=device)
+    accum_pred = torch.zeros((), device=device)
+    accum_aux = torch.zeros((), device=device)
     accum_tokens = 0
+    accum_data_time = 0.0
+    accum_model_time = 0.0
     for _micro in range(accum_steps):
+        data_start = time.perf_counter() if log_timers else None
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(data_loader)
             batch = next(data_iter)
+        if log_timers:
+            accum_data_time += time.perf_counter() - data_start
 
         input_ids, labels, loss_masks = _prepare_batch(batch, device)
         attention_mask = _build_attention_mask(
@@ -423,25 +521,52 @@ def _train_microbatches(
             model_config.patch_stride,
         )
 
+        model_start = time.perf_counter() if log_timers else None
         if autocast_dtype is None:
             outputs, stats = model(input_ids, attention_mask=attention_mask)
-            pred_loss = _forecast_loss(outputs, labels, loss_masks, loss_fn)
+            pred_loss = _forecast_loss(
+                outputs,
+                labels,
+                loss_masks,
+                loss_fn,
+                patch=model_config.patch,
+                patch_len=model_config.patch_len,
+                patch_stride=model_config.patch_stride,
+            )
         else:
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                 outputs, stats = model(input_ids, attention_mask=attention_mask)
-                pred_loss = _forecast_loss(outputs, labels, loss_masks, loss_fn)
+                pred_loss = _forecast_loss(
+                    outputs,
+                    labels,
+                    loss_masks,
+                    loss_fn,
+                    patch=model_config.patch,
+                    patch_len=model_config.patch_len,
+                    patch_stride=model_config.patch_stride,
+                )
 
         aux = aux_loss(stats)
         total_loss = pred_loss + aux_weight * aux
         (total_loss / accum_steps).backward()
+        if log_timers:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            accum_model_time += time.perf_counter() - model_start
 
-        accum_total += total_loss.item()
-        accum_pred += pred_loss.item()
-        accum_aux += aux.item()
+        accum_total += total_loss.detach()
+        accum_pred += pred_loss.detach()
+        accum_aux += aux.detach()
         accum_tokens += input_ids.numel()
-    return accum_total, accum_pred, accum_aux, accum_tokens, data_iter
-
-
+    return (
+        accum_total,
+        accum_pred,
+        accum_aux,
+        accum_tokens,
+        accum_data_time,
+        accum_model_time,
+        data_iter,
+    )
 
 
 def train(config: RunnerConfig) -> TSMOE:
@@ -455,6 +580,7 @@ def train(config: RunnerConfig) -> TSMOE:
 
     data_loader, val_loader, ood_val_loader = _build_dataloaders(config)
     model = _build_model(model_config, device)
+    model = _maybe_compile_model(model, train_config)
     optimizer, scheduler = _build_optimizer_scheduler(model, train_config, device)
     start_step = _maybe_resume_from_checkpoint(model, optimizer, scheduler, train_config, device)
 
@@ -491,103 +617,138 @@ def train(config: RunnerConfig) -> TSMOE:
     )
     mem_tracker = _CudaMemoryTracker(device, mem_logging_enabled)
 
+    profiler = _build_profiler(train_config, device, checkpoint_dir)
+    profiler_ctx = profiler if profiler is not None else nullcontext()
+
     data_iter = iter(data_loader)
-    for step_idx in range(start_step, total_steps):
-        optimizer.zero_grad(set_to_none=True)
-        accum_total, accum_pred, accum_aux, accum_tokens, data_iter = _train_microbatches(
-            model,
-            data_loader,
-            data_iter,
-            device,
-            loss_fn,
-            model_config,
-            accum_steps,
-            autocast_dtype,
-            train_config.aux_loss_weight,
-        )
-
-        if train_config.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
-        optimizer.step()
-        scheduler.step()
-        global_step = step_idx + 1
-        tokens_since_log += accum_tokens
-        mem_tracker.update()
-
-        avg_total = accum_total / accum_steps
-        avg_pred = accum_pred / accum_steps
-        avg_aux = accum_aux / accum_steps
-
-        if train_config.log_every and global_step % train_config.log_every == 0:
-            now = time.time()
-            elapsed = max(1e-6, now - last_log_time)
-            toks_per_sec = tokens_since_log / elapsed
-            lr = optimizer.param_groups[0]["lr"]
-            mem_stats = mem_tracker.snapshot() if mem_logging_enabled else None
-            mem_str = (
-                f" {_format_cuda_memory(mem_stats)}"
-                if mem_stats and train_config.log_gpu_memory_stdout
-                else ""
+    with profiler_ctx:
+        for step_idx in range(start_step, total_steps):
+            optimizer.zero_grad(set_to_none=True)
+            (
+                accum_total,
+                accum_pred,
+                accum_aux,
+                accum_tokens,
+                accum_data_time,
+                accum_model_time,
+                data_iter,
+            ) = _train_microbatches(
+                model,
+                data_loader,
+                data_iter,
+                device,
+                loss_fn,
+                model_config,
+                accum_steps,
+                autocast_dtype,
+                train_config.aux_loss_weight,
+                train_config.log_timers,
             )
-            print(
-                f"step={global_step} loss={avg_total:.4f} "
-                f"pred={avg_pred:.4f} aux={avg_aux:.4f} "
-                f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{mem_str}"
-            )
-            _log_training_step(
-                writer,
-                global_step,
-                avg_total,
-                avg_pred,
-                avg_aux,
-                lr,
-                toks_per_sec,
-                mem_stats if train_config.log_gpu_memory_tensorboard else None,
-            )
-            last_log_time = now
-            tokens_since_log = 0
-            mem_tracker.reset_interval()
 
-        if train_config.val_every and global_step % train_config.val_every == 0:
-            if val_loader is not None:
-                val_pred, val_aux, val_mae, val_mse = _run_validation(
-                    model,
-                    val_loader,
-                    device,
-                    loss_fn,
-                    model_config.patch,
-                    model_config.patch_len,
-                    model_config.patch_stride,
-                    max_batches=train_config.val_max_batches,
-                    use_bf16=train_config.use_bf16,
-                    use_amp=train_config.use_amp,
+            if train_config.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            global_step = step_idx + 1
+            tokens_since_log += accum_tokens
+            mem_tracker.update()
+
+            avg_total = accum_total / accum_steps
+            avg_pred = accum_pred / accum_steps
+            avg_aux = accum_aux / accum_steps
+
+            if profiler is not None:
+                profiler.step()
+
+            if train_config.log_every and global_step % train_config.log_every == 0:
+                now = time.time()
+                elapsed = max(1e-6, now - last_log_time)
+                toks_per_sec = tokens_since_log / elapsed
+                lr = optimizer.param_groups[0]["lr"]
+                mem_stats = mem_tracker.snapshot() if mem_logging_enabled else None
+                mem_str = (
+                    f" {_format_cuda_memory(mem_stats)}"
+                    if mem_stats and train_config.log_gpu_memory_stdout
+                    else ""
                 )
+                avg_total_val = float(avg_total)
+                avg_pred_val = float(avg_pred)
+                avg_aux_val = float(avg_aux)
                 print(
-                    f"val step={global_step} pred={val_pred:.4f} aux={val_aux:.4f} "
-                    f"mae={val_mae:.4f} mse={val_mse:.4f}"
+                    f"step={global_step} loss={avg_total_val:.4f} "
+                    f"pred={avg_pred_val:.4f} aux={avg_aux_val:.4f} "
+                    f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{mem_str}"
                 )
-                _log_validation(writer, "val", global_step, val_pred, val_aux, val_mae, val_mse)
-            if ood_val_loader is not None:
-                ood_pred, ood_aux, ood_mae, ood_mse = _run_validation(
-                    model,
-                    ood_val_loader,
-                    device,
-                    loss_fn,
-                    model_config.patch,
-                    model_config.patch_len,
-                    model_config.patch_stride,
-                    max_batches=train_config.ood_val_max_batches,
-                    use_bf16=train_config.use_bf16,
-                    use_amp=train_config.use_amp,
+                _log_training_step(
+                    writer,
+                    global_step,
+                    avg_total_val,
+                    avg_pred_val,
+                    avg_aux_val,
+                    lr,
+                    toks_per_sec,
+                    mem_stats if train_config.log_gpu_memory_tensorboard else None,
                 )
-                print(
-                    f"val_ood step={global_step} pred={ood_pred:.4f} aux={ood_aux:.4f} "
-                    f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
-                )
-                _log_validation(writer, "val_ood", global_step, ood_pred, ood_aux, ood_mae, ood_mse)
+                if train_config.log_timers:
+                    step_time = accum_data_time + accum_model_time
+                    data_ms = (accum_data_time / accum_steps) * 1000.0
+                    model_ms = (accum_model_time / accum_steps) * 1000.0
+                    step_ms = (step_time / accum_steps) * 1000.0
+                    data_pct = (accum_data_time / max(step_time, 1e-9)) * 100.0
+                    print(
+                        f"timing data={data_ms:.2f}ms model={model_ms:.2f}ms "
+                        f"step={step_ms:.2f}ms data%={data_pct:.1f}"
+                    )
+                    if writer is not None:
+                        writer.add_scalar("train/data_time_ms", data_ms, global_step)
+                        writer.add_scalar("train/model_time_ms", model_ms, global_step)
+                        writer.add_scalar("train/step_time_ms", step_ms, global_step)
+                        writer.add_scalar("train/data_time_pct", data_pct, global_step)
+                last_log_time = now
+                tokens_since_log = 0
+                mem_tracker.reset_interval()
 
-        if train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
-            _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
+            if train_config.val_every and global_step % train_config.val_every == 0:
+                if val_loader is not None:
+                    val_pred, val_aux, val_mae, val_mse = _run_validation(
+                        model,
+                        val_loader,
+                        device,
+                        loss_fn,
+                        model_config.patch,
+                        model_config.patch_len,
+                        model_config.patch_stride,
+                        max_batches=train_config.val_max_batches,
+                        use_bf16=train_config.use_bf16,
+                        use_amp=train_config.use_amp,
+                    )
+                    print(
+                        f"val step={global_step} pred={val_pred:.4f} aux={val_aux:.4f} "
+                        f"mae={val_mae:.4f} mse={val_mse:.4f}"
+                    )
+                    _log_validation(writer, "val", global_step, val_pred, val_aux, val_mae, val_mse)
+                if ood_val_loader is not None:
+                    ood_pred, ood_aux, ood_mae, ood_mse = _run_validation(
+                        model,
+                        ood_val_loader,
+                        device,
+                        loss_fn,
+                        model_config.patch,
+                        model_config.patch_len,
+                        model_config.patch_stride,
+                        max_batches=train_config.ood_val_max_batches,
+                        use_bf16=train_config.use_bf16,
+                        use_amp=train_config.use_amp,
+                    )
+                    print(
+                        f"val_ood step={global_step} pred={ood_pred:.4f} aux={ood_aux:.4f} "
+                        f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
+                    )
+                    _log_validation(writer, "val_ood", global_step, ood_pred, ood_aux, ood_mae, ood_mse)
+
+            if train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
+                _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
+
 
     if writer is not None:
         writer.close()

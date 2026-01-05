@@ -7,7 +7,29 @@ from foundation_ts.models.training.config import DatasetConfig, ModelConfig, Run
 from foundation_ts.models.training.loop import train
 
 DEBUG_PARTITIONS = ["other/m4_daily", "healthcare/hospital", "sales/dominick"]
-TRAIN_PARTITION_SET = ["energy*", "nature*", "synthetic*", "web*", "sales*", "finance*"]
+TRAIN_PARTITION_SET = [
+    "nature/beijing_air_quality",
+    "nature/china_air_quality",
+    "nature/era5_1998",
+    "nature/era5_1999",
+    "nature/era5_2000",
+    "nature/era5_2001",
+    "nature/era5_2002",
+    "nature/era5_2003",
+    "nature/era5_2004",
+    "nature/era5_2005",
+    "nature/era5_2006",
+    "nature/era5_2007",
+    "nature/cmip6_1850",
+    "nature/cmip6_1900",
+    "nature/cmip6_1950",
+    "nature/cmip6_2000",
+    "nature/cmip6_2010",
+    "energy/**",
+    "synthetic/**",
+    "web/**",
+    "sales/**",
+]
 PARTITION_SETS = {"debug": DEBUG_PARTITIONS, "train": TRAIN_PARTITION_SET}
 
 
@@ -61,6 +83,10 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tensorboard", action="store_true", default=True)
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--tensorboard-dir", default=None)
+    parser.add_argument("--profile", action="store_true", default=False)
+    parser.add_argument("--profile-dir", default=None)
+    parser.add_argument("--log-timers", action="store_true", default=False)
+    parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--pin-memory", action="store_true", default=True)
@@ -126,6 +152,10 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         resume_from_checkpoint=args.resume_checkpoint,
         tensorboard=(args.tensorboard and not args.no_tensorboard),
         tensorboard_dir=args.tensorboard_dir,
+        profile=args.profile,
+        profile_dir=args.profile_dir,
+        log_timers=args.log_timers,
+        compile=args.compile,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=(args.pin_memory and not args.no_pin_memory),

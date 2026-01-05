@@ -59,6 +59,10 @@ class TrainingConfig:
     log_gpu_memory_stdout: bool = False
     log_gpu_memory_tensorboard: bool = True
     resume_from_checkpoint: str | None = None
+    profile: bool = False
+    profile_dir: str | None = None
+    log_timers: bool = False
+    compile: bool = False
 
 
 @dataclass

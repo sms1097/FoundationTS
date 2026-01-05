@@ -42,6 +42,18 @@ def _build_attention_mask(
     return (patches.sum(dim=-1) > 0).to(loss_masks.dtype)
 
 
+def _patch_labels_and_masks(
+    labels: torch.Tensor, loss_masks: torch.Tensor, patch_len: int, patch_stride: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if labels.size(1) < patch_len:
+        raise ValueError(f"T={labels.size(1)} < patch_len={patch_len}")
+    label_patches = labels.unfold(dimension=1, size=patch_len, step=patch_stride)
+    mask_patches = loss_masks.unfold(dimension=1, size=patch_len, step=patch_stride)
+    patched_labels = label_patches[..., -1]
+    patched_masks = (mask_patches.sum(dim=-1) > 0).to(loss_masks.dtype)
+    return patched_labels, patched_masks
+
+
 def _build_horizon_targets(
     labels: torch.Tensor, loss_masks: torch.Tensor, horizon: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -62,9 +74,14 @@ def _forecast_loss(
     labels: torch.Tensor,
     loss_masks: torch.Tensor,
     loss_fn: torch.nn.Module,
+    patch: bool = False,
+    patch_len: int = 32,
+    patch_stride: int = 32,
 ) -> torch.Tensor:
     if not outputs:
         raise ValueError("Model returned empty outputs.")
+    if patch:
+        labels, loss_masks = _patch_labels_and_masks(labels, loss_masks, patch_len, patch_stride)
     total = torch.zeros((), device=labels.device)
     for horizon, pred in outputs.items():
         targets, masks = _build_horizon_targets(labels, loss_masks, horizon)

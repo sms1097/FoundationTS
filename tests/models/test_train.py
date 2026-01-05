@@ -27,6 +27,27 @@ def test_forecast_loss_masks_padding():
     assert torch.isclose(loss, torch.tensor(0.5))
 
 
+def test_forecast_loss_patch_reduces_length():
+    loss_fn = torch.nn.L1Loss(reduction="none")
+    labels = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]])
+    loss_masks = torch.ones_like(labels)
+    preds = torch.tensor([[[4.0], [10.0]]])
+    outputs = {1: preds}
+
+    loss = _forecast_loss(
+        outputs,
+        labels,
+        loss_masks,
+        loss_fn,
+        patch=True,
+        patch_len=4,
+        patch_stride=4,
+    )
+
+    # Patched labels are [4, 8], so |4-4| + |10-8| = 2 over 2 tokens.
+    assert torch.isclose(loss, torch.tensor(1.0))
+
+
 def test_build_attention_mask_patch():
     loss_masks = torch.tensor([[1, 1, 0, 0, 1, 0, 0, 0]], dtype=torch.float32)
     mask = _build_attention_mask(loss_masks, patch=True, patch_len=4, patch_stride=4)
