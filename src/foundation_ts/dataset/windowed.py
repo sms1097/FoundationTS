@@ -64,4 +64,8 @@ class WindowedDataset(torch.utils.data.Dataset):
             if seq_len > 1:
                 loss_mask[: seq_len - 1] = 1
 
-        return {"input_ids": seq[:-1], "labels": seq[1:], "loss_masks": loss_mask}
+        return {
+            "input_ids": seq[:-1],
+            "labels": seq[1:],
+            "loss_masks": loss_mask
+        }

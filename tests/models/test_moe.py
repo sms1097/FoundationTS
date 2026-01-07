@@ -1,6 +1,8 @@
+import pytest
 import torch
 
 from foundation_ts.models.tsmoe import TSMOE
+from foundation_ts.models.tsmoe.layers import Attention
 
 
 def test_moe():
@@ -33,3 +35,23 @@ def test_moe():
     inputs = torch.rand(batch_size, time_size, 1)
 
     model(inputs)
+
+
+def test_attention():
+    if not torch.cuda.is_available():
+        pytest.skip("flash-attn Attention requires CUDA")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    batch_size = 2
+    seq_len = 5
+    hidden_size = 32
+    num_heads = 4
+    x = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+    attention_mask = torch.ones(batch_size, seq_len, device=device, dtype=torch.int32)
+    attention_mask[1, -2:] = 0
+
+    attn = Attention(hidden_size=hidden_size, num_heads=num_heads).to(device).to(torch.bfloat16)
+    out = attn(x, attention_mask=attention_mask)
+
+    assert out.shape == x.shape

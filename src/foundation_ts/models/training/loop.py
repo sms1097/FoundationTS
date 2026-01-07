@@ -453,7 +453,6 @@ def _train_microbatches(
         )
 
         if autocast_dtype is None:
-            next(model.parameters()).dtype
             outputs, stats = model(input_ids, attention_mask=attention_mask)
             pred_loss = _forecast_loss(
                 outputs,

@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 
 scripts = { mypy-clean = "foundation_ts.scripts:run_mypy", foundationts = "foundation_ts.cli:main" }
 
-dependencies = ["numpy", "torch", "pyyaml", "huggingface_hub", "nvidia-ml-py"]
+dependencies = ["numpy", "torch", "pyyaml", "huggingface_hub", "nvidia-ml-py", "psutil", "flash-attn"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]

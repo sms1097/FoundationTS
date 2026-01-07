@@ -401,3 +401,53 @@ step=80 loss=3.0965 pred=0.2127 aux=144.1904 lr=8.00e-06 toks/s=53,296 tflops=12
 run model=NVIDIA H100 PCIe precision=bf16 peak_vram_gb=73.78
 ```
 
+So this means the overhead for debugging the job is from a bunch of tiny kernel launches. This is kind of expected from MOE. My focus right now is to clean up the routing and expert layer optimizations.
+
+
+Ohhh so here's a big win, I was using a dynamic mask and got the following error:
+```
+/home/ubuntu/FoundationTS/src/foundation_ts/models/tsmoe/layers.py:139: UserWarning: Flash Attention does not support non-null attn_mask. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:262.)
+```
+
+I caught this because 1) I was looking at my trace file and was suspicious of the kernel
+
+```
+fmha_cutlassB_bf16_aligned_64x64_k64_seqaligned_sm80(PyTorchMemEffAttention::AttentionBackwardKernel<cutlass::arch::Sm80, cutlass::bfloat16_t, true, false, true, 64, 64, 64, true>::Params) 
+```
+This obviously doesn't look like FA, so I want to test, I enforced using:
+
+```
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=combined_mask, is_causal=False
+    )
+```
+
+
+#### Flash Attention
+
+```
+params total=538.13M (538,130,793) active=198.39M (198,392,169)
+device model=NVIDIA H100 PCIe precision=bf16
+step=10 loss=3.4723 pred=0.5438 aux=146.4258 lr=1.00e-06 toks/s=49,275 tflops=117.31 mfu=7.02% step_ms=1163.91 sm_util=98.0% hbm_util=86.0% mem_ctrl_util=86.0%
+step=20 loss=3.2807 pred=0.3980 aux=144.1323 lr=2.00e-06 toks/s=78,262 tflops=186.32 mfu=11.15% step_ms=833.95 sm_util=100.0% hbm_util=87.0% mem_ctrl_util=87.0%
+step=30 loss=3.2408 pred=0.3415 aux=144.9621 lr=3.00e-06 toks/s=83,713 tflops=199.30 mfu=11.93% step_ms=779.90 sm_util=100.0% hbm_util=84.0% mem_ctrl_util=84.0%
+step=40 loss=3.1732 pred=0.2926 aux=144.0286 lr=4.00e-06 toks/s=84,786 tflops=201.85 mfu=12.08% step_ms=764.21 sm_util=100.0% hbm_util=87.0% mem_ctrl_util=87.0%
+step=50 loss=3.1755 pred=0.2862 aux=144.4656 lr=5.00e-06 toks/s=83,679 tflops=199.21 mfu=11.92% step_ms=772.23 sm_util=92.0% hbm_util=82.0% mem_ctrl_util=82.0%
+step=60 loss=3.1828 pred=0.2963 aux=144.3224 lr=6.00e-06 toks/s=82,145 tflops=195.56 mfu=11.70% step_ms=788.43 sm_util=100.0% hbm_util=90.0% mem_ctrl_util=90.0%
+step=70 loss=3.1560 pred=0.2819 aux=143.7047 lr=7.00e-06 toks/s=87,598 tflops=208.54 mfu=12.48% step_ms=739.79 sm_util=100.0% hbm_util=85.0% mem_ctrl_util=85.0%
+step=80 loss=3.1001 pred=0.2135 aux=144.3286 lr=8.00e-06 toks/s=89,583 tflops=213.27 mfu=12.76% step_ms=719.97 sm_util=100.0% hbm_util=84.0% mem_ctrl_util=84.0%
+run model=NVIDIA H100 PCIe precision=bf16 peak_vram_gb=59.66
+```
+
+
+Okay great, we're getting much better!
+
+Next Steps:
+1. Batch experts using grouped / batched GEMMs
+2. Agressively fuse operations
+3. Use CUDA Graphs with static shapes
+4. Increase work per kernel launch (grad accum)
+5. Stabilize shapes and execution paths
+6. Reduce Python overhead and dispatch
+7. torch.compile(mode="reduce-overhead")

@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import torch
+from flash_attn import flash_attn_varlen_qkvpacked_func
 from torch import nn
 from torch.nn import functional as F
 
 from foundation_ts.models.tsmoe.stats import MoEStats
 
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_math_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.set_float32_matmul_precision("high")
+
+
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
 
 
 class RMSNorm(nn.Module):
@@ -56,7 +66,8 @@ class RotaryEmbedding(torch.nn.Module):
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
-            seq_len=max_position_embeddings,
+            # seq_len=max_position_embeddings,
+            seq_len=4096,
             device=self.inv_freq.device,
             dtype=torch.get_default_dtype(),
         )
@@ -76,17 +87,16 @@ class RotaryEmbedding(torch.nn.Module):
         if seq_len is None:
             seq_len = x.shape[-2]
 
-        if (
-            seq_len > self.max_seq_len_cached
-            or self.cos_cached.device != x.device
-            or self.cos_cached.dtype != x.dtype
-        ):
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        # if (
+        #     seq_len > self.max_seq_len_cached
+        #     or self.cos_cached.device != x.device
+        #     or self.cos_cached.dtype != x.dtype
+        # ):
+        #     self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
-        return (
-            self.cos_cached[:seq_len],
-            self.sin_cached[:seq_len],
-        )
+        cos = self.cos_cached[:seq_len].to(dtype=x.dtype, device=x.device)
+        sin = self.sin_cached[:seq_len].to(dtype=x.dtype, device=x.device)
+        return cos, sin
 
 
 class Attention(nn.Module):
@@ -106,39 +116,61 @@ class Attention(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         # hidden_state: (B, T, D)
-        B, T, _ = hidden_state.shape
+        batch_size, seq_len, _ = hidden_state.shape
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_len), device=hidden_state.device, dtype=torch.int32
+            )
 
         qkv = self.qkv_proj(hidden_state)
-        qkv = qkv.contiguous().view(B, T, self.num_heads, 3 * self.head_dim)
+        qkv = qkv.contiguous().view(batch_size, seq_len, self.num_heads, 3 * self.head_dim)
         qkv = qkv.swapaxes(1, 2)
 
         q = qkv[..., : self.head_dim]
         k = qkv[..., self.head_dim : 2 * self.head_dim]
         v = qkv[..., 2 * self.head_dim :]
 
-        cos, sin = self.rotary_emb(q, seq_len=T)
+        cos, sin = self.rotary_emb(q, seq_len=seq_len)
+
+        # batch, seq_len, n_head, head_dim
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        attn_mask = None
-        if attention_mask is not None:
-            key_padding = attention_mask == 0
-            if key_padding.any():
-                attn_mask = key_padding[:, None, None, :]
 
-        causal_mask = torch.triu(torch.ones((T, T), device=q.device, dtype=torch.bool), diagonal=1)
-        if attn_mask is None:
-            combined_mask = causal_mask
-        else:
-            combined_mask = attn_mask | causal_mask[None, None, :, :]
-
-        # SDPA path with explicit combined mask (padding + causal)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=combined_mask,
-            is_causal=False,
-            # , scale=0.5 / math.sqrt(self.head_dim)
+        # total_tokens, 3, n_head, head_dim
+        qkv = torch.stack((q, k, v), dim=2).permute(0, 3, 2, 1, 4).reshape(
+            batch_size * seq_len, 3, self.num_heads, self.head_dim
         )
+
+        indices, cu_seqlens, max_seqlen = _get_unpad_data(attention_mask)
+
+        qkv = qkv.index_select(0, indices)
+
+        attn_out = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=True)
+        padded = torch.zeros(
+            (batch_size * seq_len, self.num_heads, self.head_dim),
+            device=attn_out.device,
+            dtype=attn_out.dtype,
+        )
+        padded.index_copy_(0, indices, attn_out)
+        attn_out = padded.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # attn_mask = None
+        # if attention_mask is not None:
+        #     key_padding = attention_mask == 0
+        #     if key_padding.any():
+        #         attn_mask = key_padding[:, None, None, :]
+
+        # causal_mask = torch.triu(torch.ones((T, T), device=q.device, dtype=torch.bool), diagonal=1)
+        # if attn_mask is None:
+        #     combined_mask = causal_mask
+        # else:
+        #     combined_mask = attn_mask | causal_mask[None, None, :, :]
+
+        # # SDPA path with explicit combined mask (padding + causal)
+        # out = torch.nn.functional.scaled_dot_product_attention(
+        #     q, k, v, attn_mask=combined_mask, is_causal=False
+        # )
+
         # Manual path (kept for reference/testing):
         # scale = 1.0 / (self.head_dim**0.5)
         # scores = torch.matmul(q, k.transpose(-2, -1)) * scale
@@ -150,8 +182,7 @@ class Attention(nn.Module):
         # out = torch.matmul(attn, v)
         # _ensure_finite("attention.sdpa", out)
 
-        out = out.swapaxes(1, 2)
-        out = self.out_proj(out.flatten(-2, -1))
+        out = self.out_proj(attn_out.flatten(-2, -1))
         return out
 
 
@@ -198,9 +229,7 @@ class MOELayer(nn.Module):
 
         self.router = Router(hidden_size, num_experts)
 
-        self.expert_layers = nn.ModuleList(
-            [ExpertFFN(hidden_size, d_expert) for _ in range(num_experts)]
-        )
+        self.expert_layers = nn.ModuleList([ExpertFFN(hidden_size, d_expert) for _ in range(num_experts)])
         self.shared_expert = ExpertFFN(hidden_size, d_ff)
 
     def forward(
