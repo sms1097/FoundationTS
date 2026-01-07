@@ -58,7 +58,16 @@ class MultiHorizonOutputLayer(nn.Module):
 
 
 class MOEDecoderLayer(nn.Module):
-    def __init__(self, hidden_size: int, num_experts: int, num_expert_layers: int, n_head: int, k: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        num_expert_layers: int,
+        n_head: int,
+        k: int,
+        d_ff: int | None = None,
+        d_expert: int | None = None,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.rms_norm1 = RMSNorm(hidden_size)
@@ -66,7 +75,7 @@ class MOEDecoderLayer(nn.Module):
         self.attention = Attention(hidden_size, n_head)
         self.rms_norm2 = RMSNorm(hidden_size)
         self.expert_layers = nn.ModuleList(
-            [MOELayer(hidden_size, num_experts, k) for _ in range(num_expert_layers)]
+            [MOELayer(hidden_size, num_experts, k, d_ff=d_ff, d_expert=d_expert) for _ in range(num_expert_layers)]
         )
 
     def forward(
@@ -98,13 +107,23 @@ class TSMOE(nn.Module):
         patch: bool,
         patch_len: int,
         patch_stride: int,
+        d_ff: int | None = None,
+        d_expert: int | None = None,
     ):
         super().__init__()
 
         self.num_experts = num_experts
         self.embed_layer = TimeEmbedding(hidden_size, patch, patch_len, patch_stride)
         self.decoder_layers = nn.ModuleList(
-            MOEDecoderLayer(hidden_size, num_experts, num_expert_layers, n_head, k)
+            MOEDecoderLayer(
+                hidden_size,
+                num_experts,
+                num_expert_layers,
+                n_head,
+                k,
+                d_ff=d_ff,
+                d_expert=d_expert,
+            )
             for _ in range(n_decoder_layers)
         )
 

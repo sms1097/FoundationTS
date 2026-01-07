@@ -182,17 +182,26 @@ class Router(nn.Module):
 
 
 class MOELayer(nn.Module):
-    def __init__(self, hidden_size: int, num_experts: int, k: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        k: int,
+        d_ff: int | None = None,
+        d_expert: int | None = None,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.k = k
+        d_expert = hidden_size // 2 if d_expert is None else d_expert
+        d_ff = hidden_size // 2 if d_ff is None else d_ff
 
         self.router = Router(hidden_size, num_experts)
 
         self.expert_layers = nn.ModuleList(
-            [ExpertFFN(hidden_size, hidden_size // 2) for _ in range(num_experts)]
+            [ExpertFFN(hidden_size, d_expert) for _ in range(num_experts)]
         )
-        self.shared_expert = ExpertFFN(hidden_size, hidden_size // 2)
+        self.shared_expert = ExpertFFN(hidden_size, d_ff)
 
     def forward(
         self, hidden_state: torch.Tensor, stats: MoEStats, attention_mask: torch.Tensor | None = None

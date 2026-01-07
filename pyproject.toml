@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 
 scripts = { mypy-clean = "foundation_ts.scripts:run_mypy", foundationts = "foundation_ts.cli:main" }
 
-dependencies = ["numpy", "torch", "pyyaml", "huggingface_hub", "tensorboard"]
+dependencies = ["numpy", "torch", "pyyaml", "huggingface_hub", "nvidia-ml-py"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]
@@ -51,7 +51,7 @@ dependencies = [
     "torch",
     "pyyaml",
     "huggingface_hub",
-    "tensorboard",
+    "nvidia-ml-py",
     "pytest",
     "ruff",
     "mypy",

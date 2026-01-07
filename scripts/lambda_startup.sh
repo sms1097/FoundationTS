@@ -10,3 +10,5 @@ source ~/py312/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 
 pip install -e .
+
+foundationts data download

@@ -47,6 +47,8 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-expert-layers", type=int, default=1)
     parser.add_argument("--k", type=int, default=2)
     parser.add_argument("--n-head", type=int, default=8)
+    parser.add_argument("--d-ff", type=int, default=None)
+    parser.add_argument("--d-expert", type=int, default=None)
     parser.add_argument("--patch", action="store_true")
     parser.add_argument("--patch-len", type=int, default=32)
     parser.add_argument("--patch-stride", type=int, default=32)
@@ -80,13 +82,11 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume-checkpoint", default=None)
-    parser.add_argument("--tensorboard", action="store_true", default=True)
-    parser.add_argument("--no-tensorboard", action="store_true")
-    parser.add_argument("--tensorboard-dir", default=None)
     parser.add_argument("--profile", action="store_true", default=False)
     parser.add_argument("--profile-dir", default=None)
-    parser.add_argument("--log-timers", action="store_true", default=False)
     parser.add_argument("--compile", action="store_true", default=False)
+    parser.add_argument("--log-perf-metrics", action="store_true", default=False)
+    parser.add_argument("--mfu-peak-tflops", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--pin-memory", action="store_true", default=True)
@@ -124,6 +124,8 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         num_expert_layers=args.num_expert_layers,
         k=args.k,
         n_head=args.n_head,
+        d_ff=args.d_ff,
+        d_expert=args.d_expert,
     )
     train_config = TrainingConfig(
         model_config=model_config,
@@ -150,12 +152,11 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=args.checkpoint_dir,
         resume_from_checkpoint=args.resume_checkpoint,
-        tensorboard=(args.tensorboard and not args.no_tensorboard),
-        tensorboard_dir=args.tensorboard_dir,
         profile=args.profile,
         profile_dir=args.profile_dir,
-        log_timers=args.log_timers,
         compile=args.compile,
+        log_perf_metrics=args.log_perf_metrics,
+        mfu_peak_tflops=args.mfu_peak_tflops,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=(args.pin_memory and not args.no_pin_memory),

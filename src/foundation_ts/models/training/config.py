@@ -21,6 +21,8 @@ class ModelConfig:
     num_expert_layers: int = 1
     k: int = 2
     n_head: int = 8
+    d_ff: int | None = None
+    d_expert: int | None = None
     horizons: list[int] = field(default_factory=lambda: [1, 8, 32, 64])
 
 
@@ -54,15 +56,12 @@ class TrainingConfig:
     val_every: int = 1000
     checkpoint_every: int = 2000
     checkpoint_dir: str = "checkpoints"
-    tensorboard: bool = True
-    tensorboard_dir: str | None = None
-    log_gpu_memory_stdout: bool = False
-    log_gpu_memory_tensorboard: bool = True
     resume_from_checkpoint: str | None = None
     profile: bool = False
     profile_dir: str | None = None
-    log_timers: bool = False
     compile: bool = False
+    log_perf_metrics: bool = False
+    mfu_peak_tflops: float | None = None
 
 
 @dataclass

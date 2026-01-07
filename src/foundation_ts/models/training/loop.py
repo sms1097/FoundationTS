@@ -3,11 +3,13 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-import shutil
 
 import torch
 from torch.utils.data import DataLoader, random_split
-from torch.utils.tensorboard import SummaryWriter
+try:
+    import pynvml
+except ImportError:  # pragma: no cover - optional dependency
+    pynvml = None
 
 from foundation_ts.dataset import build_ts_dataset
 from foundation_ts.models.training.config import RunnerConfig
@@ -107,6 +109,8 @@ def _build_model(model_config, device: torch.device) -> TSMOE:
         k=model_config.k,
         n_head=model_config.n_head,
         horizons=model_config.horizons,
+        d_ff=model_config.d_ff,
+        d_expert=model_config.d_expert,
     )
     model.to(device)
     return model
@@ -115,7 +119,7 @@ def _build_model(model_config, device: torch.device) -> TSMOE:
 def _maybe_compile_model(model, train_config):
     if not train_config.compile:
         return model
-    return torch.compile(model)
+    return torch.compile(model, mode="max-autotune")
 
 
 def _build_optimizer_scheduler(
@@ -211,26 +215,17 @@ def _build_profiler(train_config, device: torch.device, checkpoint_dir: Path):
         active=profile_active,
         repeat=profile_repeat,
     )
-    trace_handler = torch.profiler.tensorboard_trace_handler(str(profile_dir))
     chrome_trace_path = profile_dir / "chrome_trace.json"
     exported = False
 
-    def _latest_trace_file() -> Path | None:
-        candidates = list(profile_dir.rglob("*.pt.trace.json"))
-        candidates += [p for p in profile_dir.rglob("*trace.json") if p.name != chrome_trace_path.name]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-
     def on_trace_ready(prof: torch.profiler.profile) -> None:
         nonlocal exported
-        trace_handler(prof)
         if exported:
             return
-        latest = _latest_trace_file()
-        if latest is None:
+        try:
+            prof.export_chrome_trace(str(chrome_trace_path))
+        except Exception:
             return
-        shutil.copy2(latest, chrome_trace_path)
         exported = True
 
     profiler = torch.profiler.profile(
@@ -242,6 +237,20 @@ def _build_profiler(train_config, device: torch.device, checkpoint_dir: Path):
         with_stack=True,
     )
     return profiler
+
+
+def _build_perf_profiler(train_config, device: torch.device):
+    if not train_config.log_perf_metrics or train_config.profile:
+        return None
+    if device.type != "cuda":
+        return None
+    return torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+    )
 
 
 @torch.no_grad()
@@ -328,44 +337,6 @@ def _run_validation(
     )
 
 
-def _log_training_step(
-    writer: SummaryWriter | None,
-    global_step: int,
-    avg_total: float,
-    avg_pred: float,
-    avg_aux: float,
-    lr: float,
-    toks_per_sec: float,
-    mem_stats: dict[str, float] | None,
-) -> None:
-    if writer is None:
-        return
-    writer.add_scalar("train/loss", avg_total, global_step)
-    writer.add_scalar("train/pred_loss", avg_pred, global_step)
-    writer.add_scalar("train/aux_loss", avg_aux, global_step)
-    writer.add_scalar("train/lr", lr, global_step)
-    writer.add_scalar("train/toks_per_sec", toks_per_sec, global_step)
-    if mem_stats:
-        _log_cuda_memory(writer, global_step, mem_stats)
-
-
-def _log_validation(
-    writer: SummaryWriter | None,
-    prefix: str,
-    global_step: int,
-    pred: float,
-    aux: float,
-    mae: float,
-    mse: float,
-) -> None:
-    if writer is None:
-        return
-    writer.add_scalar(f"{prefix}/pred_loss", pred, global_step)
-    writer.add_scalar(f"{prefix}/aux_loss", aux, global_step)
-    writer.add_scalar(f"{prefix}/mae", mae, global_step)
-    writer.add_scalar(f"{prefix}/mse", mse, global_step)
-
-
 def _format_param_count(value: int) -> str:
     if value >= 1_000_000_000:
         return f"{value / 1_000_000_000:.2f}B"
@@ -390,99 +361,65 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
     return total_params, active_params
 
 
-def _bytes_to_mib(value: float) -> float:
-    return value / (1024.0 * 1024.0)
+def _estimate_flops_per_token(active_params: int) -> float:
+    # Rough estimate: 6 * params for forward, 6 * params for backward.
+    return 12.0 * active_params
 
 
-def _format_cuda_memory(mem_stats: dict[str, float]) -> str:
-    alloc_cur = _bytes_to_mib(mem_stats["allocated_current"])
-    alloc_peak = _bytes_to_mib(mem_stats["allocated_peak"])
-    alloc_min = _bytes_to_mib(mem_stats["allocated_min"])
-    alloc_max = _bytes_to_mib(mem_stats["allocated_max"])
-    res_cur = _bytes_to_mib(mem_stats["reserved_current"])
-    res_peak = _bytes_to_mib(mem_stats["reserved_peak"])
-    res_min = _bytes_to_mib(mem_stats["reserved_min"])
-    res_max = _bytes_to_mib(mem_stats["reserved_max"])
-    active_cur = _bytes_to_mib(mem_stats["active_current"])
-    active_peak = _bytes_to_mib(mem_stats["active_peak"])
-    extras = []
-    if mem_stats["alloc_retries"] > 0:
-        extras.append(f"alloc_retries={int(mem_stats['alloc_retries'])}")
-    if mem_stats["ooms"] > 0:
-        extras.append(f"ooms={int(mem_stats['ooms'])}")
-    extra_str = f" {' '.join(extras)}" if extras else ""
-    return (
-        "gpu_mem(MiB) "
-        f"alloc={alloc_cur:.0f}/{alloc_peak:.0f} min/max={alloc_min:.0f}/{alloc_max:.0f} "
-        f"res={res_cur:.0f}/{res_peak:.0f} min/max={res_min:.0f}/{res_max:.0f} "
-        f"active={active_cur:.0f}/{active_peak:.0f}{extra_str}"
-    )
+def _format_precision(train_config, device: torch.device) -> str:
+    if device.type == "cuda" and train_config.use_amp and train_config.use_bf16:
+        return "bf16"
+    return "fp32"
 
 
-def _log_cuda_memory(writer: SummaryWriter, global_step: int, mem_stats: dict[str, float]) -> None:
-    writer.add_scalar(
-        "memory/allocated_current_mb", _bytes_to_mib(mem_stats["allocated_current"]), global_step
-    )
-    writer.add_scalar("memory/allocated_peak_mb", _bytes_to_mib(mem_stats["allocated_peak"]), global_step)
-    writer.add_scalar("memory/allocated_min_mb", _bytes_to_mib(mem_stats["allocated_min"]), global_step)
-    writer.add_scalar("memory/allocated_max_mb", _bytes_to_mib(mem_stats["allocated_max"]), global_step)
-    writer.add_scalar("memory/reserved_current_mb", _bytes_to_mib(mem_stats["reserved_current"]), global_step)
-    writer.add_scalar("memory/reserved_peak_mb", _bytes_to_mib(mem_stats["reserved_peak"]), global_step)
-    writer.add_scalar("memory/reserved_min_mb", _bytes_to_mib(mem_stats["reserved_min"]), global_step)
-    writer.add_scalar("memory/reserved_max_mb", _bytes_to_mib(mem_stats["reserved_max"]), global_step)
-    writer.add_scalar("memory/active_current_mb", _bytes_to_mib(mem_stats["active_current"]), global_step)
-    writer.add_scalar("memory/active_peak_mb", _bytes_to_mib(mem_stats["active_peak"]), global_step)
-    writer.add_scalar("memory/alloc_retries", mem_stats["alloc_retries"], global_step)
-    writer.add_scalar("memory/ooms", mem_stats["ooms"], global_step)
+def _count_cuda_events(events: list[object]) -> int:
+    count = 0
+    for evt in events:
+        device_type = getattr(evt, "device_type", None)
+        if device_type is None:
+            continue
+        if isinstance(device_type, str):
+            is_cuda = device_type.lower() == "cuda"
+        else:
+            is_cuda = str(device_type).lower().endswith("cuda")
+        if is_cuda:
+            count += 1
+    return count
 
 
-class _CudaMemoryTracker:
+def _bytes_to_gib(value: float) -> float:
+    return value / (1024.0**3)
+
+
+class _NvmlUtilTracker:
     def __init__(self, device: torch.device, enabled: bool) -> None:
-        self.device = device
-        self.enabled = enabled and device.type == "cuda"
-        self.reset_interval()
-
-    def reset_interval(self) -> None:
+        self.enabled = bool(enabled and device.type == "cuda" and pynvml is not None)
+        self.handle = None
         if not self.enabled:
             return
-        self.min_allocated = None
-        self.max_allocated = 0.0
-        self.min_reserved = None
-        self.max_reserved = 0.0
-        torch.cuda.reset_peak_memory_stats(self.device)
-
-    def update(self) -> None:
-        if not self.enabled:
-            return
-        allocated = float(torch.cuda.memory_allocated(self.device))
-        reserved = float(torch.cuda.memory_reserved(self.device))
-        if self.min_allocated is None or allocated < self.min_allocated:
-            self.min_allocated = allocated
-        if self.min_reserved is None or reserved < self.min_reserved:
-            self.min_reserved = reserved
-        if allocated > self.max_allocated:
-            self.max_allocated = allocated
-        if reserved > self.max_reserved:
-            self.max_reserved = reserved
+        try:
+            pynvml.nvmlInit()
+            index = device.index if device.index is not None else 0
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        except Exception:
+            self.enabled = False
 
     def snapshot(self) -> dict[str, float] | None:
-        if not self.enabled:
+        if not self.enabled or self.handle is None:
             return None
-        stats = torch.cuda.memory_stats(self.device)
-        return {
-            "allocated_current": float(stats.get("allocated_bytes.all.current", 0.0)),
-            "allocated_peak": float(stats.get("allocated_bytes.all.peak", 0.0)),
-            "allocated_min": float(self.min_allocated or 0.0),
-            "allocated_max": float(self.max_allocated),
-            "reserved_current": float(stats.get("reserved_bytes.all.current", 0.0)),
-            "reserved_peak": float(stats.get("reserved_bytes.all.peak", 0.0)),
-            "reserved_min": float(self.min_reserved or 0.0),
-            "reserved_max": float(self.max_reserved),
-            "active_current": float(stats.get("active_bytes.all.current", 0.0)),
-            "active_peak": float(stats.get("active_bytes.all.peak", 0.0)),
-            "alloc_retries": float(stats.get("num_alloc_retries", 0.0)),
-            "ooms": float(stats.get("num_ooms", 0.0)),
-        }
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(self.handle)
+            return {"sm_util": float(util.gpu), "mem_util": float(util.memory)}
+        except Exception:
+            return None
+
+    def shutdown(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
 
 def _train_microbatches(
@@ -495,23 +432,17 @@ def _train_microbatches(
     accum_steps: int,
     autocast_dtype,
     aux_weight: float,
-    log_timers: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float, float, object]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, object]:
     accum_total = torch.zeros((), device=device)
     accum_pred = torch.zeros((), device=device)
     accum_aux = torch.zeros((), device=device)
     accum_tokens = 0
-    accum_data_time = 0.0
-    accum_model_time = 0.0
     for _micro in range(accum_steps):
-        data_start = time.perf_counter() if log_timers else None
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(data_loader)
             batch = next(data_iter)
-        if log_timers:
-            accum_data_time += time.perf_counter() - data_start
 
         input_ids, labels, loss_masks = _prepare_batch(batch, device)
         attention_mask = _build_attention_mask(
@@ -521,8 +452,8 @@ def _train_microbatches(
             model_config.patch_stride,
         )
 
-        model_start = time.perf_counter() if log_timers else None
         if autocast_dtype is None:
+            next(model.parameters()).dtype
             outputs, stats = model(input_ids, attention_mask=attention_mask)
             pred_loss = _forecast_loss(
                 outputs,
@@ -549,10 +480,6 @@ def _train_microbatches(
         aux = aux_loss(stats)
         total_loss = pred_loss + aux_weight * aux
         (total_loss / accum_steps).backward()
-        if log_timers:
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            accum_model_time += time.perf_counter() - model_start
 
         accum_total += total_loss.detach()
         accum_pred += pred_loss.detach()
@@ -563,8 +490,6 @@ def _train_microbatches(
         accum_pred,
         accum_aux,
         accum_tokens,
-        accum_data_time,
-        accum_model_time,
         data_iter,
     )
 
@@ -587,50 +512,55 @@ def train(config: RunnerConfig) -> TSMOE:
     total_steps = train_config.epochs * train_config.steps_per_epoch
 
     total_params, active_params = _estimate_active_params(model)
+    flops_per_token = _estimate_flops_per_token(active_params)
+    peak_flops = (
+        train_config.mfu_peak_tflops * 1e12 if train_config.mfu_peak_tflops else None
+    )
     print(
         "params "
         f"total={_format_param_count(total_params)} ({total_params:,}) "
         f"active={_format_param_count(active_params)} ({active_params:,})"
     )
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(device)
+    else:
+        gpu_name = "cpu"
+    precision = _format_precision(train_config, device)
+    print(f"device model={gpu_name} precision={precision}")
 
     model.train()
     checkpoint_dir = Path(train_config.checkpoint_dir)
     last_log_time = time.time()
     tokens_since_log = 0
-    writer = None
-    if train_config.tensorboard:
-        log_dir = (
-            Path(train_config.tensorboard_dir)
-            if train_config.tensorboard_dir
-            else Path(train_config.checkpoint_dir) / "tensorboard"
-        )
-        writer = SummaryWriter(log_dir=str(log_dir))
+    steps_since_log = 0
+    step_time_since_log = 0.0
     accum_steps = max(1, train_config.grad_accum_steps)
     use_amp = train_config.use_amp and train_config.use_bf16 and device.type == "cuda"
     autocast_dtype = torch.bfloat16 if use_amp else None
-    mem_logging_enabled = bool(
-        device.type == "cuda"
-        and (
-            train_config.log_gpu_memory_stdout
-            or (writer is not None and train_config.log_gpu_memory_tensorboard)
-        )
-    )
-    mem_tracker = _CudaMemoryTracker(device, mem_logging_enabled)
+    if device.type == "cuda" and train_config.log_perf_metrics:
+        torch.cuda.reset_peak_memory_stats(device)
+    nvml_tracker = _NvmlUtilTracker(device, train_config.log_perf_metrics)
+    peak_vram_bytes = 0.0
+    kernel_launches_total = 0
+    kernel_steps_total = 0
 
     profiler = _build_profiler(train_config, device, checkpoint_dir)
-    profiler_ctx = profiler if profiler is not None else nullcontext()
+    perf_profiler = _build_perf_profiler(train_config, device)
+    active_profiler = profiler or perf_profiler
+    profiler_ctx = active_profiler if active_profiler is not None else nullcontext()
+    kernel_profiler = active_profiler if train_config.log_perf_metrics else None
+    last_kernel_event_count = 0
 
     data_iter = iter(data_loader)
     with profiler_ctx:
         for step_idx in range(start_step, total_steps):
+            step_start = time.perf_counter() if train_config.log_perf_metrics else None
             optimizer.zero_grad(set_to_none=True)
             (
                 accum_total,
                 accum_pred,
                 accum_aux,
                 accum_tokens,
-                accum_data_time,
-                accum_model_time,
                 data_iter,
             ) = _train_microbatches(
                 model,
@@ -642,71 +572,91 @@ def train(config: RunnerConfig) -> TSMOE:
                 accum_steps,
                 autocast_dtype,
                 train_config.aux_loss_weight,
-                train_config.log_timers,
             )
 
             if train_config.max_grad_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
             optimizer.step()
             scheduler.step()
+            if step_start is not None:
+                step_time_since_log += time.perf_counter() - step_start
             global_step = step_idx + 1
             tokens_since_log += accum_tokens
-            mem_tracker.update()
+            steps_since_log += 1
 
             avg_total = accum_total / accum_steps
             avg_pred = accum_pred / accum_steps
             avg_aux = accum_aux / accum_steps
 
-            if profiler is not None:
-                profiler.step()
+            if active_profiler is not None:
+                active_profiler.step()
 
             if train_config.log_every and global_step % train_config.log_every == 0:
                 now = time.time()
                 elapsed = max(1e-6, now - last_log_time)
                 toks_per_sec = tokens_since_log / elapsed
                 lr = optimizer.param_groups[0]["lr"]
-                mem_stats = mem_tracker.snapshot() if mem_logging_enabled else None
-                mem_str = (
-                    f" {_format_cuda_memory(mem_stats)}"
-                    if mem_stats and train_config.log_gpu_memory_stdout
-                    else ""
-                )
+                if device.type == "cuda" and train_config.log_perf_metrics:
+                    peak_vram_bytes = max(peak_vram_bytes, torch.cuda.max_memory_reserved(device))
+                tflops = None
+                mfu = None
+                step_time_ms = None
+                sm_util = None
+                hbm_util = None
+                mem_ctrl_util = None
+                kernel_launches_per_step = None
+                if train_config.log_perf_metrics:
+                    tflops = (toks_per_sec * flops_per_token) / 1e12
+                    if peak_flops:
+                        mfu = (toks_per_sec * flops_per_token) / peak_flops
+                    if steps_since_log > 0:
+                        step_time_ms = (step_time_since_log / steps_since_log) * 1000.0
+                    util_stats = nvml_tracker.snapshot()
+                    if util_stats is not None:
+                        sm_util = util_stats.get("sm_util")
+                        hbm_util = util_stats.get("mem_util")
+                        mem_ctrl_util = util_stats.get("mem_util")
+                    if kernel_profiler is not None:
+                        try:
+                            events = kernel_profiler.events()
+                        except Exception:
+                            events = None
+                        if events:
+                            event_count = _count_cuda_events(events)
+                            delta = event_count - last_kernel_event_count
+                            if delta > 0 and steps_since_log > 0:
+                                kernel_launches_per_step = delta / steps_since_log
+                                kernel_launches_total += delta
+                                kernel_steps_total += steps_since_log
+                            last_kernel_event_count = event_count
+                perf_parts = []
+                if tflops is not None:
+                    perf_parts.append(f"tflops={tflops:.2f}")
+                if mfu is not None:
+                    perf_parts.append(f"mfu={mfu * 100:.2f}%")
+                if step_time_ms is not None:
+                    perf_parts.append(f"step_ms={step_time_ms:.2f}")
+                if sm_util is not None:
+                    perf_parts.append(f"sm_util={sm_util:.1f}%")
+                if hbm_util is not None:
+                    perf_parts.append(f"hbm_util={hbm_util:.1f}%")
+                if mem_ctrl_util is not None:
+                    perf_parts.append(f"mem_ctrl_util={mem_ctrl_util:.1f}%")
+                if kernel_launches_per_step is not None:
+                    perf_parts.append(f"kernels/step={kernel_launches_per_step:.1f}")
+                perf_str = f" {' '.join(perf_parts)}" if perf_parts else ""
                 avg_total_val = float(avg_total)
                 avg_pred_val = float(avg_pred)
                 avg_aux_val = float(avg_aux)
                 print(
                     f"step={global_step} loss={avg_total_val:.4f} "
                     f"pred={avg_pred_val:.4f} aux={avg_aux_val:.4f} "
-                    f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{mem_str}"
+                    f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{perf_str}"
                 )
-                _log_training_step(
-                    writer,
-                    global_step,
-                    avg_total_val,
-                    avg_pred_val,
-                    avg_aux_val,
-                    lr,
-                    toks_per_sec,
-                    mem_stats if train_config.log_gpu_memory_tensorboard else None,
-                )
-                if train_config.log_timers:
-                    step_time = accum_data_time + accum_model_time
-                    data_ms = (accum_data_time / accum_steps) * 1000.0
-                    model_ms = (accum_model_time / accum_steps) * 1000.0
-                    step_ms = (step_time / accum_steps) * 1000.0
-                    data_pct = (accum_data_time / max(step_time, 1e-9)) * 100.0
-                    print(
-                        f"timing data={data_ms:.2f}ms model={model_ms:.2f}ms "
-                        f"step={step_ms:.2f}ms data%={data_pct:.1f}"
-                    )
-                    if writer is not None:
-                        writer.add_scalar("train/data_time_ms", data_ms, global_step)
-                        writer.add_scalar("train/model_time_ms", model_ms, global_step)
-                        writer.add_scalar("train/step_time_ms", step_ms, global_step)
-                        writer.add_scalar("train/data_time_pct", data_pct, global_step)
                 last_log_time = now
                 tokens_since_log = 0
-                mem_tracker.reset_interval()
+                steps_since_log = 0
+                step_time_since_log = 0.0
 
             if train_config.val_every and global_step % train_config.val_every == 0:
                 if val_loader is not None:
@@ -726,7 +676,6 @@ def train(config: RunnerConfig) -> TSMOE:
                         f"val step={global_step} pred={val_pred:.4f} aux={val_aux:.4f} "
                         f"mae={val_mae:.4f} mse={val_mse:.4f}"
                     )
-                    _log_validation(writer, "val", global_step, val_pred, val_aux, val_mae, val_mse)
                 if ood_val_loader is not None:
                     ood_pred, ood_aux, ood_mae, ood_mse = _run_validation(
                         model,
@@ -744,13 +693,26 @@ def train(config: RunnerConfig) -> TSMOE:
                         f"val_ood step={global_step} pred={ood_pred:.4f} aux={ood_aux:.4f} "
                         f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
                     )
-                    _log_validation(writer, "val_ood", global_step, ood_pred, ood_aux, ood_mae, ood_mse)
 
             if train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
                 _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
 
 
-    if writer is not None:
-        writer.close()
+    if train_config.log_perf_metrics:
+        if device.type == "cuda":
+            peak_vram_bytes = max(peak_vram_bytes, torch.cuda.max_memory_reserved(device))
+        summary_parts = [f"model={gpu_name}", f"precision={precision}"]
+        if device.type == "cuda":
+            summary_parts.append(f"peak_vram_gb={_bytes_to_gib(peak_vram_bytes):.2f}")
+        if kernel_steps_total > 0:
+            kernel_avg = kernel_launches_total / kernel_steps_total
+            summary_parts.append(f"kernels/step={kernel_avg:.1f}")
+        print(f"run {' '.join(summary_parts)}")
 
+    if profiler is not None:
+        sort_key = "cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
+        print("top_kernels")
+        print(profiler.key_averages().table(sort_by=sort_key, row_limit=10))
+
+    nvml_tracker.shutdown()
     return model
