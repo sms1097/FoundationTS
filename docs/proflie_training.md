@@ -126,7 +126,7 @@ foundationts train \
   --log-every 10 \
   --checkpoint-every 0 \
   --log-perf-metrics \
-  --mfu-peak-tflops 1671
+  --mfu-peak-tflops 1979
 ```
 
 ### Baseline
@@ -441,13 +441,62 @@ run model=NVIDIA H100 PCIe precision=bf16 peak_vram_gb=59.66
 ```
 
 
-Okay great, we're getting much better!
+## Next Day, new baseline
+I actually spent some time thinking about the spec sheet and realized that I was not using the right mfu peak flops. I decided to swap to the SXM instance from lambda to test it out. It gave a new baseline for the same config setup. I'm noticing that Peak vram isn't maxed out. I'm going to keep it fixed right now because I don't want to venture to far from powers of 2 and I'm at 1024 right now, with definitely OOM.
 
-Next Steps:
-1. Batch experts using grouped / batched GEMMs
-2. Agressively fuse operations
-3. Use CUDA Graphs with static shapes
-4. Increase work per kernel launch (grad accum)
-5. Stabilize shapes and execution paths
-6. Reduce Python overhead and dispatch
-7. torch.compile(mode="reduce-overhead")
+```
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=3.4723 pred=0.5438 aux=146.4259 lr=1.00e-06 toks/s=77,863 tflops=185.37 mfu=9.37% step_ms=686.02 sm_util=100.0% hbm_util=75.0% mem_ctrl_util=75.0%
+step=20 loss=3.2807 pred=0.3980 aux=144.1319 lr=2.00e-06 toks/s=126,711 tflops=301.66 mfu=15.24% step_ms=511.60 sm_util=100.0% hbm_util=78.0% mem_ctrl_util=78.0%
+step=30 loss=3.2408 pred=0.3415 aux=144.9618 lr=3.00e-06 toks/s=128,574 tflops=306.10 mfu=15.47% step_ms=500.61 sm_util=84.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=40 loss=3.1732 pred=0.2926 aux=144.0277 lr=4.00e-06 toks/s=131,520 tflops=313.11 mfu=15.82% step_ms=489.07 sm_util=92.0% hbm_util=70.0% mem_ctrl_util=70.0%
+step=50 loss=3.1755 pred=0.2862 aux=144.4636 lr=5.00e-06 toks/s=131,273 tflops=312.52 mfu=15.79% step_ms=490.27 sm_util=94.0% hbm_util=75.0% mem_ctrl_util=75.0%
+step=60 loss=3.1826 pred=0.2963 aux=144.3156 lr=6.00e-06 toks/s=132,127 tflops=314.56 mfu=15.89% step_ms=487.00 sm_util=100.0% hbm_util=81.0% mem_ctrl_util=81.0%
+step=70 loss=3.1557 pred=0.2819 aux=143.6907 lr=7.00e-06 toks/s=133,710 tflops=318.32 mfu=16.09% step_ms=481.74 sm_util=75.0% hbm_util=51.0% mem_ctrl_util=51.0%
+step=80 loss=3.1004 pred=0.2135 aux=144.3428 lr=8.00e-06 toks/s=134,339 tflops=319.82 mfu=16.16% step_ms=478.67 sm_util=100.0% hbm_util=76.0% mem_ctrl_util=76.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=59.75
+```
+
+
+### Fixing Torch Compile
+So to fix torch compile, I need to make the experts not have dynamic shape. Right now, I compute experts doing the sort approach.
+```
+y_sorted = torch.empty_like(x_sorted)
+
+for i, exp in enumerate(self.expert_layers):
+    s_i, t = starts[i], offsets[i]
+    if s_i == t:
+        continue
+
+    y_sorted[s_i:t] = exp(x_sorted[s_i:t])
+```
+
+This actually isn't great for compute because you have to launch separate kernels which means more overhead to move data/launch kernels. SO instead I'm going to make one large batched expert and add capactiy. These were the results:
+
+
+#### Capacity
+```
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=260.1877 pred=257.2556 aux=146.6084 lr=1.00e-06 toks/s=97,833 tflops=232.91 mfu=11.77% step_ms=525.89 sm_util=99.0% hbm_util=76.0% mem_ctrl_util=76.0%
+step=20 loss=257.3439 pred=254.4228 aux=146.0539 lr=2.00e-06 toks/s=143,708 tflops=342.13 mfu=17.29% step_ms=453.71 sm_util=99.0% hbm_util=76.0% mem_ctrl_util=76.0%
+step=30 loss=263.2367 pred=260.2896 aux=147.3550 lr=3.00e-06 toks/s=148,691 tflops=353.99 mfu=17.89% step_ms=438.56 sm_util=99.0% hbm_util=77.0% mem_ctrl_util=77.0%
+step=40 loss=249.2698 pred=246.3304 aux=146.9663 lr=4.00e-06 toks/s=150,914 tflops=359.28 mfu=18.15% step_ms=431.99 sm_util=95.0% hbm_util=71.0% mem_ctrl_util=71.0%
+step=50 loss=246.9605 pred=244.0118 aux=147.4350 lr=5.00e-06 toks/s=148,779 tflops=354.20 mfu=17.90% step_ms=438.29 sm_util=96.0% hbm_util=73.0% mem_ctrl_util=73.0%
+step=60 loss=218.4926 pred=215.5468 aux=147.2906 lr=6.00e-06 toks/s=148,668 tflops=353.93 mfu=17.88% step_ms=438.64 sm_util=89.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=70 loss=203.1577 pred=200.2224 aux=146.7654 lr=7.00e-06 toks/s=154,296 tflops=367.33 mfu=18.56% step_ms=422.57 sm_util=99.0% hbm_util=76.0% mem_ctrl_util=76.0%
+step=80 loss=220.8421 pred=217.9195 aux=146.1325 lr=8.00e-06 toks/s=147,688 tflops=351.60 mfu=17.77% step_ms=441.54 sm_util=99.0% hbm_util=76.0% mem_ctrl_util=76.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=78.14
+```
+
+
+#### Capactiy Compiled
+well it didn't compile
+```
+
+```
+
+
+
+#### TODO
+- I need to reason about why the two MOE layers have different performance and why the "Efficient" one is much worse (half perf)
+- I need to figure out what other MOE frameworks do for this part of the network I'm trying to optimize

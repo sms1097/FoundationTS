@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from foundation_ts.models.tsmoe.layers import Attention, MOELayer, RMSNorm
+from foundation_ts.models.tsmoe.layers import Attention, EfficientMOELayer, RMSNorm
 from foundation_ts.models.tsmoe.stats import MoEStats
 
 
@@ -67,15 +67,32 @@ class MOEDecoderLayer(nn.Module):
         k: int,
         d_ff: int | None = None,
         d_expert: int | None = None,
+        max_batch_tokens: int | None = None,
+        capacity_factor: float = 1.25,
+        drop_policy: str = "drop",
     ):
         super().__init__()
+        if max_batch_tokens is None:
+            raise ValueError("max_batch_tokens is required for EfficientMOELayer.")
         self.num_experts = num_experts
         self.rms_norm1 = RMSNorm(hidden_size)
 
         self.attention = Attention(hidden_size, n_head)
         self.rms_norm2 = RMSNorm(hidden_size)
         self.expert_layers = nn.ModuleList(
-            [MOELayer(hidden_size, num_experts, k, d_ff=d_ff, d_expert=d_expert) for _ in range(num_expert_layers)]
+            [
+                EfficientMOELayer(
+                    hidden_size,
+                    num_experts,
+                    k,
+                    max_batch_tokens=max_batch_tokens,
+                    d_ff=d_ff,
+                    d_expert=d_expert,
+                    capacity_factor=capacity_factor,
+                    drop_policy=drop_policy,
+                )
+                for _ in range(num_expert_layers)
+            ]
         )
 
     def forward(
@@ -109,8 +126,13 @@ class TSMOE(nn.Module):
         patch_stride: int,
         d_ff: int | None = None,
         d_expert: int | None = None,
+        max_batch_tokens: int | None = None,
+        capacity_factor: float = 1.25,
+        drop_policy: str = "drop",
     ):
         super().__init__()
+        if max_batch_tokens is None:
+            raise ValueError("max_batch_tokens is required for EfficientMOELayer.")
 
         self.num_experts = num_experts
         self.embed_layer = TimeEmbedding(hidden_size, patch, patch_len, patch_stride)
@@ -123,6 +145,9 @@ class TSMOE(nn.Module):
                 k,
                 d_ff=d_ff,
                 d_expert=d_expert,
+                max_batch_tokens=max_batch_tokens,
+                capacity_factor=capacity_factor,
+                drop_policy=drop_policy,
             )
             for _ in range(n_decoder_layers)
         )

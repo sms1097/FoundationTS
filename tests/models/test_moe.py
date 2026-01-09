@@ -6,6 +6,8 @@ from foundation_ts.models.tsmoe.layers import Attention
 
 
 def test_moe():
+    if not torch.cuda.is_available():
+        pytest.skip("TSMOE MoE test requires CUDA")
     hidden_size = 32
     n_decoder_layers = 5
     patch = False
@@ -18,7 +20,10 @@ def test_moe():
     batch_size = 6
     time_size = 8
     k = 2
+    capacity_factor = 0.5
+    max_batch_tokens = batch_size * time_size
 
+    device = torch.device("cuda")
     model = TSMOE(
         hidden_size,
         n_decoder_layers,
@@ -30,11 +35,20 @@ def test_moe():
         patch,
         patch_len,
         patch_stride,
-    )
+        max_batch_tokens=max_batch_tokens,
+        capacity_factor=capacity_factor,
+    ).to(device).to(torch.bfloat16)
 
-    inputs = torch.rand(batch_size, time_size, 1)
+    inputs = torch.rand(batch_size, time_size, 1, dtype=torch.bfloat16, device=device)
+    attention_mask = torch.ones(batch_size, time_size, device=device, dtype=torch.int32)
+    attention_mask[0, -2:] = 0
 
-    model(inputs)
+    outputs, stats = model(inputs, attention_mask=attention_mask)
+    assert set(outputs.keys()) == set(horizons)
+    for h in horizons:
+        assert outputs[h].shape == (batch_size, time_size, h)
+    assert stats.importance.shape == (num_experts,)
+    assert stats.load.shape == (num_experts,)
 
 
 def test_attention():

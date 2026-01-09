@@ -23,7 +23,7 @@ from foundation_ts.models.training.utils import (
     aux_loss,
 )
 from foundation_ts.models.tsmoe import TSMOE
-from foundation_ts.models.tsmoe.layers import MOELayer
+from foundation_ts.models.tsmoe.layers import EfficientMOELayer
 
 
 def _get_device(device: str | None) -> torch.device:
@@ -97,7 +97,7 @@ def _build_dataloaders(
     return data_loader, val_loader, ood_val_loader
 
 
-def _build_model(model_config, device: torch.device) -> TSMOE:
+def _build_model(model_config, device: torch.device, max_batch_tokens: int) -> TSMOE:
     model = TSMOE(
         hidden_size=model_config.hidden_size,
         n_decoder_layers=model_config.n_decoder_layers,
@@ -111,6 +111,7 @@ def _build_model(model_config, device: torch.device) -> TSMOE:
         horizons=model_config.horizons,
         d_ff=model_config.d_ff,
         d_expert=model_config.d_expert,
+        max_batch_tokens=max_batch_tokens,
     )
     model.to(device)
     return model
@@ -352,13 +353,23 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
     expert_params = 0
     active_expert_params = 0.0
     for module in model.modules():
-        if isinstance(module, MOELayer):
-            layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
+        if isinstance(module, EfficientMOELayer):
+            layer_expert_params = sum(p.numel() for p in module.experts.parameters())
             expert_params += layer_expert_params
             if module.num_experts:
                 active_expert_params += layer_expert_params * (module.k / module.num_experts)
     active_params = int(round(total_params - expert_params + active_expert_params))
     return total_params, active_params
+
+
+def _infer_max_batch_tokens(config: RunnerConfig) -> int:
+    seq_len = config.dataset_config.seq_max_len
+    model_config = config.train_config.model_config
+    if model_config.patch:
+        if seq_len < model_config.patch_len:
+            raise ValueError(f"seq_max_len={seq_len} < patch_len={model_config.patch_len}")
+        seq_len = 1 + (seq_len - model_config.patch_len) // model_config.patch_stride
+    return seq_len * config.train_config.batch_size
 
 
 def _estimate_flops_per_token(active_params: int) -> float:
@@ -503,7 +514,8 @@ def train(config: RunnerConfig) -> TSMOE:
     _set_seed(train_config.seed)
 
     data_loader, val_loader, ood_val_loader = _build_dataloaders(config)
-    model = _build_model(model_config, device)
+    max_batch_tokens = _infer_max_batch_tokens(config)
+    model = _build_model(model_config, device, max_batch_tokens)
     model = _maybe_compile_model(model, train_config)
     optimizer, scheduler = _build_optimizer_scheduler(model, train_config, device)
     start_step = _maybe_resume_from_checkpoint(model, optimizer, scheduler, train_config, device)

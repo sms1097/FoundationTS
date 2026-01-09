@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 from flash_attn import flash_attn_varlen_qkvpacked_func
 from torch import nn
@@ -119,9 +120,7 @@ class Attention(nn.Module):
         batch_size, seq_len, _ = hidden_state.shape
 
         if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_len), device=hidden_state.device, dtype=torch.int32
-            )
+            attention_mask = torch.ones((batch_size, seq_len), device=hidden_state.device, dtype=torch.int32)
 
         qkv = self.qkv_proj(hidden_state)
         qkv = qkv.contiguous().view(batch_size, seq_len, self.num_heads, 3 * self.head_dim)
@@ -137,8 +136,10 @@ class Attention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # total_tokens, 3, n_head, head_dim
-        qkv = torch.stack((q, k, v), dim=2).permute(0, 3, 2, 1, 4).reshape(
-            batch_size * seq_len, 3, self.num_heads, self.head_dim
+        qkv = (
+            torch.stack((q, k, v), dim=2)
+            .permute(0, 3, 2, 1, 4)
+            .reshape(batch_size * seq_len, 3, self.num_heads, self.head_dim)
         )
 
         indices, cu_seqlens, max_seqlen = _get_unpad_data(attention_mask)
@@ -306,6 +307,345 @@ class MOELayer(nn.Module):
                 load = masked_counts / (masked_counts.sum() + 1e-12)
             else:
                 load = torch.zeros(self.num_experts, device=counts.device, dtype=router_scores.dtype)
+
+        stats.add_values_(importance, load)
+
+        return y_out, stats
+
+
+class BatchedExperts(torch.nn.Module):
+    def __init__(self, num_experts, hidden, ff):
+        super().__init__()
+        self.w1 = torch.nn.Parameter(torch.randn(num_experts, hidden, ff))
+        self.w2 = torch.nn.Parameter(torch.randn(num_experts, ff, hidden))
+
+    def forward(self, x):
+        # x: [E, C, H]
+        x = torch.einsum("ech,ehf->ecf", x, self.w1)
+        x = torch.nn.functional.gelu(x)
+        x = torch.einsum("ecf,efh->ech", x, self.w2)
+        return x
+
+
+# --- Example interfaces you said you have ---
+# Router(hidden_size, num_experts) -> (router_scores[B,T,E], shared_score[B,T,1])
+# BatchedExperts(num_experts, hidden_size, d_expert) accepts [E,C,D] -> [E,C,D]
+# ExpertFFN(hidden_size, d_ff) accepts [N,D] -> [N,D]
+# MoEStats has add_values_(importance, load)
+
+
+class EfficientMOELayer(nn.Module):
+    """
+    Compile-friendly MoE:
+      - fixed expert capacity (static shape)
+      - vectorized dispatch (no Python loops)
+      - data-dependent masking only (no shape changes)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        k: int,
+        max_batch_tokens: int,  # <-- REQUIRED for fixed capacity
+        d_ff: int | None = None,
+        d_expert: int | None = None,
+        capacity_factor: float = 1.25,  # typical 1.1-1.3; tune
+        drop_policy: str = "drop",  # "drop" (recommended) or "zero"
+    ):
+        super().__init__()
+        assert k >= 1
+        assert drop_policy in ("drop", "zero")
+
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.k = k
+        self.capacity_factor = float(capacity_factor)
+        self.drop_policy = drop_policy
+
+        # Fixed capacity based on maximum tokens this layer will ever see in one forward.
+        # This is the *shape contract* that enables compilation.
+        cap = math.ceil(max_batch_tokens * k / num_experts * self.capacity_factor)
+        self.capacity = max(1, int(cap))
+
+        d_expert = hidden_size // 2 if d_expert is None else d_expert
+        d_ff = hidden_size // 2 if d_ff is None else d_ff
+
+        self.router = Router(hidden_size, num_experts)
+        self.experts = BatchedExperts(num_experts, hidden_size, d_expert)
+        self.shared_expert = ExpertFFN(hidden_size, d_ff)
+
+    @torch.no_grad()
+    def _check_static(self, B: int, T: int):
+        # optional sanity check for debugging; comment out in production
+        pass
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,  # [B,T,D]
+        stats,
+        attention_mask: torch.Tensor | None = None,  # [B,T] with 1 for valid
+    ):
+        B, T, D = hidden_state.shape
+        N = B * T
+        E = self.num_experts
+        K = self.k
+        C = self.capacity
+
+        # Router
+        router_scores, shared_expert_score = self.router(hidden_state)  # [B,T,E], [B,T,1]
+        # topk along experts
+        topk_vals, topk_idx = torch.topk(router_scores, k=K, dim=-1)  # [B,T,K], [B,T,K]
+
+        # (Optional) renormalize gates per token for top-k
+        # This is usually helpful for stability; keep if you want.
+        # topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # Flatten tokens
+        x = hidden_state.reshape(N, D)  # [N,D]
+
+        # Build routing lists length R = N*K (static length given B,T,K)
+        # token_for_route: [R]
+        token_ids = torch.arange(N, device=hidden_state.device)
+        token_for_route = token_ids.repeat_interleave(K)  # [N*K]
+        expert_for_route = topk_idx.reshape(-1)  # [N*K]
+        gate_for_route = topk_vals.reshape(-1)  # [N*K]
+
+        # Mask out padded tokens (data-only, no shape change)
+        if attention_mask is not None:
+            # [N] bool
+            flat_mask = attention_mask.reshape(N).to(device=hidden_state.device)
+            valid_token = flat_mask > 0
+            # expand to routes [N*K]
+            valid_route = valid_token.repeat_interleave(K)
+            # zero invalid routes
+            gate_for_route = gate_for_route * valid_route.to(gate_for_route.dtype)
+            # send invalid routes to expert 0; gate=0 ensures no effect
+            expert_for_route = torch.where(valid_route, expert_for_route, torch.zeros_like(expert_for_route))
+
+        # Sort routes by expert id (still static length)
+        expert_sorted, order = torch.sort(expert_for_route)  # [R]
+        token_sorted = token_for_route[order]  # [R]
+        gate_sorted = gate_for_route[order]  # [R]
+        x_sorted = x[token_sorted]  # [R,D]
+
+        # Count per expert (static E)
+        counts = torch.bincount(expert_sorted, minlength=E)  # [E]
+        offsets = torch.cumsum(counts, dim=0)  # [E]
+        starts = offsets - counts  # [E]
+
+        # Position within each expert segment: [R]
+        # positions[r] = r - starts[expert_sorted[r]]
+        r = torch.arange(expert_sorted.numel(), device=hidden_state.device)
+        positions = r - starts[expert_sorted]
+
+        # Keep within capacity; IMPORTANT: do NOT change shapes.
+        in_cap = positions < C  # [R] bool
+
+        # Also drop routes with zero gate (e.g., padded tokens). Keep shape static.
+        nonzero = gate_sorted != 0
+        keep = in_cap & nonzero
+
+        # Prepare expert input buffer: [E,C,D] static
+        expert_inputs = x_sorted.new_zeros((E, C, D))
+
+        # Scatter kept routes into expert buffers (vectorized, no Python loop)
+        # Advanced indexing writes (E_idx, pos_idx) rows.
+        e_idx = expert_sorted
+        p_idx = positions.clamp(min=0, max=C - 1)  # safe for dropped items; they'll be masked by `keep`
+        # only write kept items
+        if self.drop_policy == "drop":
+            # For dropped items, do nothing (they remain zeros)
+            expert_inputs[e_idx[keep], p_idx[keep]] = x_sorted[keep]
+        else:
+            # "zero" is same here because buffer is zeros; left for completeness
+            expert_inputs[e_idx[keep], p_idx[keep]] = x_sorted[keep]
+
+        # Run all experts in one call (static)
+        expert_outputs = self.experts(expert_inputs)  # [E,C,D]
+
+        # Gather outputs for each route (static R)
+        y_sorted = expert_outputs[e_idx, p_idx]  # [R,D]
+
+        # Zero out dropped/invalid routes, then apply gates
+        y_sorted = y_sorted * keep.to(y_sorted.dtype).unsqueeze(-1)
+        y_sorted = y_sorted * gate_sorted.to(y_sorted.dtype).unsqueeze(-1)
+
+        # Scatter-add back to tokens: [N,D] static
+        y_out = x.new_zeros((N, D))
+        y_out.scatter_add_(0, token_sorted.unsqueeze(-1).expand(-1, D), y_sorted.to(y_out.dtype))
+        y_out = y_out.reshape(B, T, D)
+
+        # Shared expert (dense) path
+        shared_out = self.shared_expert(x).reshape(B, T, D)
+        y_out = y_out + shared_expert_score.to(y_out.dtype) * shared_out
+
+        # --- stats / aux (kept close to your code) ---
+        # Important: use original (unmasked) routing for importance,
+        # and masked routing for load if attention_mask exists.
+        if attention_mask is None:
+            # load based on routed topk indices (all tokens)
+            load_counts = torch.bincount(expert_for_route, minlength=E)
+            load = load_counts / (load_counts.sum() + 1e-12)
+            importance = router_scores.mean(dim=(0, 1))
+        else:
+            flat_mask = attention_mask.reshape(N).to(device=router_scores.device)
+            denom = flat_mask.sum() + 1e-12
+            importance = (router_scores * flat_mask.view(B, T, 1)).sum(dim=(0, 1)) / denom
+
+            # load should reflect only valid tokens (gate nonzero)
+            # expert_for_route here already has invalid routes redirected to 0 but gate=0.
+            # So count only nonzero-gated routes:
+            valid_routes = gate_for_route != 0
+            load_counts = (
+                torch.bincount(expert_for_route[valid_routes], minlength=E)
+                if valid_routes.any()
+                else torch.zeros(E, device=router_scores.device, dtype=torch.long)
+            )
+            load = load_counts / (load_counts.sum() + 1e-12)
+
+        stats.add_values_(importance, load)
+
+        return y_out, stats
+
+
+class AdaptiveMOELayer(nn.Module):
+    """
+    Dynamic-capacity MoE (non-compile-friendly):
+      - capacity is derived from the current batch
+      - uses batched experts but includes per-batch routing compaction
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        k: int,
+        d_ff: int | None = None,
+        d_expert: int | None = None,
+        capacity_factor: float = 1.25,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k = k
+        self.capacity_factor = float(capacity_factor)
+
+        d_expert = hidden_size // 2 if d_expert is None else d_expert
+        d_ff = hidden_size // 2 if d_ff is None else d_ff
+
+        self.router = Router(hidden_size, num_experts)
+        self.experts = BatchedExperts(num_experts, hidden_size, d_expert)
+        self.shared_expert = ExpertFFN(hidden_size, d_ff)
+
+    def forward(
+        self, hidden_state: torch.Tensor, stats: MoEStats, attention_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, ...]:
+        # flatten input
+        B, T, D = hidden_state.shape
+        N = B * T
+
+        # apply router and normalize weights
+        # router_scores: (B,T,N), shared_expert_score: (B,T,1)
+        router_scores, shared_expert_score = self.router(hidden_state)
+        topk_vals, topk_idx = torch.topk(router_scores, k=self.k)
+
+        # TODO: Consider adding the renomalization back in
+        # topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Flatten routing for dispatch
+        x = hidden_state.reshape(N, D)
+
+        # info tensors to group by expert
+        expert_for_route = topk_idx.reshape(-1)
+        gate_for_route = topk_vals.reshape(-1)
+        token_ids = torch.arange(N, device=hidden_state.device)
+        token_for_route = token_ids.repeat_interleave(self.k)
+
+        if attention_mask is None:
+            tokens_per_batch = N
+        else:
+            flat_mask = attention_mask.reshape(N).to(device=hidden_state.device)
+            route_valid = flat_mask.repeat_interleave(self.k) > 0
+            expert_for_route = expert_for_route[route_valid]
+            gate_for_route = gate_for_route[route_valid]
+            token_for_route = token_for_route[route_valid]
+            tokens_per_batch = int(flat_mask.sum().item())
+
+        capacity = int(math.ceil(tokens_per_batch * self.k / self.num_experts * self.capacity_factor))
+        capacity = max(1, capacity)
+
+        # actually group by expert
+        expert_sorted, compute_order = torch.sort(expert_for_route)
+        gate_sorted = gate_for_route[compute_order]
+        token_sorted = token_for_route[compute_order]
+        x_sorted = x[token_sorted]
+
+        # Apply the experts on grouped data
+        if expert_sorted.numel():
+            counts = torch.bincount(expert_sorted, minlength=self.num_experts)
+            offsets = torch.cumsum(counts, dim=0)
+            starts = offsets - counts
+            positions = (
+                torch.arange(expert_sorted.numel(), device=expert_sorted.device) - starts[expert_sorted]
+            )
+            keep = positions < capacity
+            if keep.sum() < keep.numel():
+                expert_sorted = expert_sorted[keep]
+                gate_sorted = gate_sorted[keep]
+                token_sorted = token_sorted[keep]
+                x_sorted = x_sorted[keep]
+                counts = torch.bincount(expert_sorted, minlength=self.num_experts)
+                offsets = torch.cumsum(counts, dim=0)
+                starts = offsets - counts
+
+            y_sorted = torch.empty_like(x_sorted)
+            expert_inputs = torch.zeros(
+                (self.num_experts, capacity, D),
+                device=x_sorted.device,
+                dtype=x_sorted.dtype,
+            )
+            for i in range(self.num_experts):
+                s_i, t = starts[i], offsets[i]
+                if s_i == t:
+                    continue
+                expert_inputs[i, : t - s_i] = x_sorted[s_i:t]
+
+            expert_outputs = self.experts(expert_inputs)
+            for i in range(self.num_experts):
+                s_i, t = starts[i], offsets[i]
+                if s_i == t:
+                    continue
+                y_sorted[s_i:t] = expert_outputs[i, : t - s_i]
+        else:
+            y_sorted = torch.empty_like(x_sorted)
+
+        # weight the outputs
+        y_sorted = y_sorted * gate_sorted.unsqueeze(-1)
+
+        # finalize output by adding
+        y_out = torch.zeros(N, D, device=y_sorted.device, dtype=y_sorted.dtype)
+        if token_sorted.numel():
+            y_out.scatter_add_(0, index=token_sorted.unsqueeze(-1).expand(-1, D), src=y_sorted)
+        y_out = y_out.reshape(B, T, D)
+
+        shared_in = hidden_state.reshape(N, D)
+        shared_out = self.shared_expert(shared_in).reshape(B, T, D)
+        y_out = y_out + shared_expert_score * shared_out
+
+        # aux loss specifics
+        if attention_mask is None:
+            counts = torch.bincount(expert_for_route, minlength=self.num_experts)
+            load = counts / (counts.sum() + 1e-12)  # (N,)
+            importance = router_scores.mean(dim=(0, 1))
+        else:
+            flat_mask = attention_mask.reshape(N).to(device=router_scores.device)
+            denom = flat_mask.sum() + 1e-12
+            importance = (router_scores * flat_mask.view(B, T, 1)).sum(dim=(0, 1)) / denom
+            if expert_for_route.numel():
+                masked_counts = torch.bincount(expert_for_route, minlength=self.num_experts)
+                load = masked_counts / (masked_counts.sum() + 1e-12)
+            else:
+                load = torch.zeros(self.num_experts, device=router_scores.device, dtype=router_scores.dtype)
 
         stats.add_values_(importance, load)
 
