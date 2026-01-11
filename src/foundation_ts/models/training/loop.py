@@ -4,20 +4,17 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
+import pynvml
 import torch
 from torch.utils.data import DataLoader, random_split
-try:
-    import pynvml
-except ImportError:  # pragma: no cover - optional dependency
-    pynvml = None
 
 from foundation_ts.dataset import build_ts_dataset
 from foundation_ts.models.training.config import RunnerConfig
 from foundation_ts.models.training.utils import (
     _build_attention_mask,
     _build_horizon_targets,
-    _patch_labels_and_masks,
     _forecast_loss,
+    _patch_labels_and_masks,
     _prepare_batch,
     _set_seed,
     aux_loss,

@@ -2,15 +2,23 @@
 
 Minimal time-series dataset utilities with torch-first, lazy windowing.
 
-Install
+Install (editable)
+
+The runtime dependencies `torch`, `psutil`, and `flash-attn` must be installed in order; they are listed under the `runtime` extra in `pyproject.toml` but should be installed manually with `--no-build-isolation` for `flash-attn`.
 
 ```bash
+pip install torch
+pip install psutil
+pip install --no-build-isolation flash-attn
 pip install -e .
 ```
 
-For a regular install:
+Regular install:
 
 ```bash
+pip install torch
+pip install psutil
+pip install --no-build-isolation flash-attn
 pip install .
 ```
 
@@ -35,6 +43,9 @@ print(sample["input_ids"].shape, sample["labels"].shape, sample["loss_masks"].sh
 Install dependencies (editable):
 
 ```bash
+pip install torch
+pip install psutil
+pip install --no-build-isolation flash-attn
 pip install -e .
 ```
 

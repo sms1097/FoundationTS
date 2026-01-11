@@ -490,11 +490,47 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=78.14
 
 
 #### Capactiy Compiled
-well it didn't compile
+well it didn't compile...
+
+
+### Next Day
+I'm just going to isolate the MOE layers until I find the one that works the best and use that. I cranked up Batch so the tflops and ms are more fun to look at.
+Here's the baseline:
+```
+Benchmark settings batch=512 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloat16 backward=True
+MOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=15,880,819 step_ms=132.06 tflops=150.75
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=16,034,768 step_ms=130.79 tflops=152.21
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=26,188,956 step_ms=80.08 tflops=248.60
+AdaptiveMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=10,492,107 step_ms=199.88 tflops=99.60
 ```
 
+
+But interestingly, when I test with the attention mask, I see these numbers:
+```
+Benchmark settings batch=512 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloat16 backward=True
+MOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=15,830,824 step_ms=132.47 tflops=150.27
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=2,301,000 step_ms=911.41 tflops=21.84
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=2,399,856 step_ms=873.87 tflops=22.78
+AdaptiveMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=13,139,833 step_ms=159.60 tflops=124.73
 ```
 
+So the attention mask just kills performance!
 
 
 #### TODO

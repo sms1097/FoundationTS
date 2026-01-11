@@ -259,6 +259,13 @@ class MOELayer(nn.Module):
         token_ids = torch.arange(N, device=hidden_state.device)
         token_for_route = token_ids.repeat_interleave(self.k)
 
+        if attention_mask is not None:
+            flat_mask = attention_mask.reshape(N).to(device=hidden_state.device)
+            route_valid = flat_mask.repeat_interleave(self.k) > 0
+            expert_for_route = expert_for_route[route_valid]
+            gate_for_route = gate_for_route[route_valid]
+            token_for_route = token_for_route[route_valid]
+
         # actually group by expert
         expert_sorted, compute_order = torch.sort(expert_for_route)
         gate_sorted = gate_for_route[compute_order]
@@ -291,6 +298,8 @@ class MOELayer(nn.Module):
         shared_out = self.shared_expert(shared_in).reshape(B, T, D)
 
         y_out = y_out + shared_expert_score * shared_out
+        if attention_mask is not None:
+            y_out = y_out * attention_mask.unsqueeze(-1).to(y_out.dtype)
 
         # aux loss specifics
         if attention_mask is None:
@@ -301,9 +310,8 @@ class MOELayer(nn.Module):
             flat_mask = attention_mask.reshape(N).to(device=router_scores.device)
             denom = flat_mask.sum() + 1e-12
             importance = (router_scores * flat_mask.view(B, T, 1)).sum(dim=(0, 1)) / denom
-            route_valid = flat_mask.repeat_interleave(self.k) > 0
-            if route_valid.any():
-                masked_counts = torch.bincount(expert_for_route[route_valid], minlength=self.num_experts)
+            if expert_for_route.numel():
+                masked_counts = torch.bincount(expert_for_route, minlength=self.num_experts)
                 load = masked_counts / (masked_counts.sum() + 1e-12)
             else:
                 load = torch.zeros(self.num_experts, device=counts.device, dtype=router_scores.dtype)
@@ -327,19 +335,12 @@ class BatchedExperts(torch.nn.Module):
         return x
 
 
-# --- Example interfaces you said you have ---
-# Router(hidden_size, num_experts) -> (router_scores[B,T,E], shared_score[B,T,1])
-# BatchedExperts(num_experts, hidden_size, d_expert) accepts [E,C,D] -> [E,C,D]
-# ExpertFFN(hidden_size, d_ff) accepts [N,D] -> [N,D]
-# MoEStats has add_values_(importance, load)
-
-
 class EfficientMOELayer(nn.Module):
     """
     Compile-friendly MoE:
-      - fixed expert capacity (static shape)
-      - vectorized dispatch (no Python loops)
-      - data-dependent masking only (no shape changes)
+      - fixed expert capacity(static shape
+      - vectorized dispatch no Python loops
+      - data-dependent masking only no shape changes
     """
 
     def __init__(
@@ -350,7 +351,7 @@ class EfficientMOELayer(nn.Module):
         max_batch_tokens: int,  # <-- REQUIRED for fixed capacity
         d_ff: int | None = None,
         d_expert: int | None = None,
-        capacity_factor: float = 1.25,  # typical 1.1-1.3; tune
+        capacity_factor: float = 1.3,  # typical 1.1-1.3; tune
         drop_policy: str = "drop",  # "drop" (recommended) or "zero"
     ):
         super().__init__()
@@ -374,11 +375,6 @@ class EfficientMOELayer(nn.Module):
         self.router = Router(hidden_size, num_experts)
         self.experts = BatchedExperts(num_experts, hidden_size, d_expert)
         self.shared_expert = ExpertFFN(hidden_size, d_ff)
-
-    @torch.no_grad()
-    def _check_static(self, B: int, T: int):
-        # optional sanity check for debugging; comment out in production
-        pass
 
     def forward(
         self,
@@ -424,6 +420,7 @@ class EfficientMOELayer(nn.Module):
             expert_for_route = torch.where(valid_route, expert_for_route, torch.zeros_like(expert_for_route))
 
         # Sort routes by expert id (still static length)
+        # TODO: Test with torch.unique_consectutive and torch.search_sorted
         expert_sorted, order = torch.sort(expert_for_route)  # [R]
         token_sorted = token_for_route[order]  # [R]
         gate_sorted = gate_for_route[order]  # [R]

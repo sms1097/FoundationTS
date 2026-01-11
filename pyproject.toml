@@ -12,10 +12,11 @@ license = { file = "LICENSE" }
 
 scripts = { mypy-clean = "foundation_ts.scripts:run_mypy", foundationts = "foundation_ts.cli:main" }
 
-dependencies = ["numpy", "torch", "pyyaml", "huggingface_hub", "nvidia-ml-py", "psutil", "flash-attn"]
+dependencies = ["numpy", "pyyaml", "huggingface_hub", "nvidia-ml-py"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]
+runtime = ["torch", "psutil", "flash-attn"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
