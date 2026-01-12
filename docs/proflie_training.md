@@ -36,6 +36,7 @@ Notes:
 - The schedule is fixed: wait=10, warmup=10, active=1, repeat=1.
 - Use `--compile` to enable `torch.compile` for steady-state performance tests.
 
+
 ### Performance metrics
 
 Use `--log-perf-metrics` to print step-level performance stats to stdout:
@@ -493,7 +494,7 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=78.14
 well it didn't compile...
 
 
-### Next Day
+### MOE Layer Deep Dive
 I'm just going to isolate the MOE layers until I find the one that works the best and use that. I cranked up Batch so the tflops and ms are more fun to look at.
 Here's the baseline:
 ```
@@ -538,8 +539,7 @@ I looked at some trace files for the MOE layers and found the issue. We spend 19
 void (anonymous namespace)::indexing_backward_kernel<c10::BFloat16, 4>(long const*, long const*, c10::BFloat16 const*, c10::BFloat16*, long, long, long, long, bool) 
 ```
 
-This is caused by the attention mask altering a variable `expert_for_route`, which determines the indexing order for the expert layer input. To solve this, we just ned to change how we apply the mask. Right now we do something like this:
-
+This is caused by the attention mask altering a variable `expert_for_route`, which determines the indexing order for the expert layer input. We currently use the attetion mask like this:
 
 ```
 if attention_mask is not None:
@@ -552,9 +552,233 @@ p_idx = positions.clamp(min=0, max=C - 1)  # safe for dropped items; they'll be 
 expert_inputs[e_idx[keep], p_idx[keep]] = x_sorted[keep]
 ```
 
-This works when the attention mask is not none, because keep is relatively deterministic
+This works when the attention mask is not none, because keep is deterministic, but the attention mask really messes things up with the re-indexing.
+
+
+So I tried replacing with a new formulation:
+
+```
+lin = e_idx * C + p_idx  # linear slot in [E*C]
+src = x_sorted * keep.to(x_sorted.dtype).unsqueeze(-1)
+expert_inputs_flat = expert_inputs.view(E*C, D)
+expert_inputs_flat.scatter_(0, lin.unsqueeze(-1).expand(-1, D), src)
+expert_inputs = expert_inputs_flat.view(E, C, D)
+
+expert_outputs_flat = expert_outputs.view(E * C, D)
+lin_safe = torch.where(keep, lin, torch.zeros_like(lin))
+```
+
+This gets rid of a 2d indexing operations
+
+Here's the new performance 
+```
+((py312) ) ubuntu@192-222-54-52:~/FoundationTS$ /home/ubuntu/py312/bin/python /home/ubuntu/FoundationTS/scripts/benchmark_moe_layers.py
+Benchmark settings batch=128 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloat16 backward=True
+MOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=16,968,051 step_ms=30.90 tflops=161.07
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=13,112,611 step_ms=39.98 tflops=124.47
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=16,326,827 step_ms=32.11 tflops=154.98
+```
+
+This is better, but not really where we want to be.
+
+It turns out there's a new monstrous backwards kernel, this one takes ~10ms. 
+```
+void at::native::indexFuncLargeIndex<c10::BFloat16, long, unsigned int, 2, 2, -2, true, at::native::(anonymous namespace)::ReduceAdd>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, unsigned int, long, long, at::native::(anonymous namespace)::ReduceAdd const&, c10::BFloat16) 
+```
+
+I replaced all of the index operations with a `scatter_add` and got this new perf report:
+
+```
+Benchmark settings batch=128 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloat16 backward=True
+MOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=16,942,215 step_ms=30.95 tflops=160.82
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=17,116,561 step_ms=30.63 tflops=162.48
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=20,727,827 step_ms=25.29 tflops=196.76
+```
+
+
+
+
+#### MoE routing examples
+
+Below are small, self-contained snippets that mirror the routing changes we tested in
+`EfficientMOELayer` for performance debugging.
+
+Baseline gather (index_select on a flattened buffer):
+
+```python
+# expert_outputs: [E, C, D]
+expert_outputs_flat = expert_outputs.view(E * C, D)
+lin = e_idx * C + p_idx
+lin_safe = torch.where(keep, lin, torch.zeros_like(lin))
+y_sorted = expert_outputs_flat.index_select(0, lin_safe)  # [R, D]
+y_sorted = y_sorted * keep.to(y_sorted.dtype).unsqueeze(-1)
+y_sorted = y_sorted * gate_sorted.to(y_sorted.dtype).unsqueeze(-1)
+```
+
+Scatter-based inversion (avoids index_select in backward and is compile-friendly):
+
+```python
+# expert_outputs: [E, C, D]
+expert_outputs_flat = expert_outputs.view(E * C, D)
+lin_valid = lin[keep]
+token_valid = token_sorted[keep]
+gate_valid = gate_sorted[keep]
+
+slot_gate = x_sorted.new_zeros((E * C,))
+slot_gate = torch.scatter(slot_gate, 0, lin_valid, gate_valid.to(slot_gate.dtype))
+slot_token = torch.full((E * C,), -1, device=hidden_state.device, dtype=torch.long)
+slot_token = torch.scatter(slot_token, 0, lin_valid, token_valid)
+
+slot_outputs = expert_outputs_flat * slot_gate.unsqueeze(-1)
+slot_mask = slot_token >= 0
+
+y_out = x.new_zeros((N, D))
+y_out = torch.scatter_add(
+    y_out,
+    0,
+    slot_token[slot_mask].unsqueeze(-1).expand(-1, D),
+    slot_outputs[slot_mask].to(y_out.dtype),
+)
+```
+
+
+### MOE Layer Adjustments
+
+
+```
+params total=538.13M (538,130,793) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=264.0115 pred=261.1106 aux=145.0443 lr=1.00e-06 toks/s=104,872 tflops=249.67 mfu=12.62% step_ms=470.78 sm_util=99.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=20 loss=254.5965 pred=251.6948 aux=145.0851 lr=2.00e-06 toks/s=167,239 tflops=398.15 mfu=20.12% step_ms=389.21 sm_util=90.0% hbm_util=50.0% mem_ctrl_util=50.0%
+step=30 loss=260.2265 pred=257.3271 aux=144.9687 lr=3.00e-06 toks/s=168,132 tflops=400.27 mfu=20.23% step_ms=387.10 sm_util=99.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=40 loss=252.8084 pred=249.9070 aux=145.0677 lr=4.00e-06 toks/s=167,274 tflops=398.23 mfu=20.12% step_ms=389.08 sm_util=99.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=50 loss=213.8530 pred=210.9552 aux=144.8889 lr=5.00e-06 toks/s=168,853 tflops=401.99 mfu=20.31% step_ms=385.35 sm_util=99.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=60 loss=204.3833 pred=201.4752 aux=145.4029 lr=6.00e-06 toks/s=167,954 tflops=399.85 mfu=20.20% step_ms=387.51 sm_util=94.0% hbm_util=53.0% mem_ctrl_util=53.0%
+step=70 loss=196.7672 pred=193.8608 aux=145.3186 lr=7.00e-06 toks/s=169,481 tflops=403.49 mfu=20.39% step_ms=384.09 sm_util=99.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=80 loss=204.6532 pred=201.7394 aux=145.6887 lr=8.00e-06 toks/s=168,381 tflops=400.87 mfu=20.26% step_ms=386.54 sm_util=93.0% hbm_util=54.0% mem_ctrl_util=54.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=58.86
+```
+
+
+### Another Torch.Compile (with Capacity)
+
+So ran compile, good improvements, but....
+```
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] Graph break from `Tensor.item()`, consider setting:
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] or:
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] to include these operations in the captured graph.
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] 
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] Graph break: from user code at:
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0]   File "/home/ubuntu/FoundationTS/src/foundation_ts/models/tsmoe/layers.py", line 17, in torch_dynamo_resume_in__get_unpad_data_at_16
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0]     max_seqlen_in_batch = seqlens_in_batch.max().item()
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] 
+W0112 02:58:28.700000 60377 torch/_dynamo/variables/tensor.py:1048] [6/0] 
+step=10 loss=264.4143 pred=261.4405 aux=148.6890 lr=1.00e-06 toks/s=32,890 tflops=78.30 mfu=3.96% step_ms=1856.21 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=20 loss=253.0651 pred=250.0910 aux=148.7041 lr=2.00e-06 toks/s=204,843 tflops=487.67 mfu=24.64% step_ms=317.57 sm_util=77.0% hbm_util=47.0% mem_ctrl_util=47.0%
+step=30 loss=261.7725 pred=258.8101 aux=148.1219 lr=3.00e-06 toks/s=205,881 tflops=490.14 mfu=24.77% step_ms=316.02 sm_util=82.0% hbm_util=51.0% mem_ctrl_util=51.0%
+step=40 loss=242.5769 pred=239.6313 aux=147.2762 lr=4.00e-06 toks/s=205,334 tflops=488.84 mfu=24.70% step_ms=316.80 sm_util=85.0% hbm_util=52.0% mem_ctrl_util=52.0%
+step=50 loss=215.3560 pred=212.3647 aux=149.5612 lr=5.00e-06 toks/s=207,706 tflops=494.49 mfu=24.99% step_ms=313.05 sm_util=90.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=60 loss=183.9454 pred=180.8614 aux=154.2012 lr=6.00e-06 toks/s=206,202 tflops=490.91 mfu=24.81% step_ms=315.49 sm_util=97.0% hbm_util=69.0% mem_ctrl_util=69.0%
+step=70 loss=206.5421 pred=203.6012 aux=147.0445 lr=7.00e-06 toks/s=208,748 tflops=496.97 mfu=25.11% step_ms=311.67 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=80 loss=192.7895 pred=189.8213 aux=148.4076 lr=8.00e-06 toks/s=206,775 tflops=492.27 mfu=24.87% step_ms=314.65 sm_util=83.0% hbm_util=52.0% mem_ctrl_util=52.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=58.54
+```
+
+Small error with 3 options:
+1. Just use `shape[-1]`, easy fix, slightly less efficient:
+2. Keep the real max and allow scalar capture (set torch._dynamo.config.capture_scalar_outputs = True or env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1), or
+3. Compute the max outside the compiled region and pass it in (e.g., precompute from the mask in the caller and add an optional max_seqlen arg).
+
+
+Option #1:
+```
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=265.0006 pred=262.0271 aux=148.6784 lr=1.00e-06 toks/s=61,167 tflops=145.62 mfu=7.36% step_ms=937.98 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=20 loss=252.7030 pred=249.7288 aux=148.7090 lr=2.00e-06 toks/s=205,738 tflops=489.80 mfu=24.75% step_ms=316.15 sm_util=85.0% hbm_util=52.0% mem_ctrl_util=52.0%
+step=30 loss=262.0685 pred=259.1057 aux=148.1399 lr=3.00e-06 toks/s=207,131 tflops=493.12 mfu=24.92% step_ms=314.09 sm_util=91.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=40 loss=244.8419 pred=241.9019 aux=146.9976 lr=4.00e-06 toks/s=206,085 tflops=490.63 mfu=24.79% step_ms=315.62 sm_util=97.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=50 loss=220.7739 pred=217.7923 aux=149.0798 lr=5.00e-06 toks/s=208,538 tflops=496.47 mfu=25.09% step_ms=311.89 sm_util=87.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=60 loss=191.5695 pred=188.5015 aux=153.3991 lr=6.00e-06 toks/s=207,482 tflops=493.95 mfu=24.96% step_ms=313.51 sm_util=82.0% hbm_util=52.0% mem_ctrl_util=52.0%
+step=70 loss=197.8744 pred=194.8877 aux=149.3340 lr=7.00e-06 toks/s=209,586 tflops=498.96 mfu=25.21% step_ms=310.44 sm_util=90.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=80 loss=178.6148 pred=175.6185 aux=149.8148 lr=8.00e-06 toks/s=207,672 tflops=494.41 mfu=24.98% step_ms=313.18 sm_util=92.0% hbm_util=63.0% mem_ctrl_util=63.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=58.54
+```
+
+Option #2:
+```
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=264.9703 pred=261.9965 aux=148.6910 lr=1.00e-06 toks/s=60,184 tflops=143.28 mfu=7.24% step_ms=930.56 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=20 loss=254.1951 pred=251.2219 aux=148.6612 lr=2.00e-06 toks/s=205,598 tflops=489.47 mfu=24.73% step_ms=316.37 sm_util=87.0% hbm_util=55.0% mem_ctrl_util=55.0%
+step=30 loss=261.6329 pred=258.6715 aux=148.0693 lr=3.00e-06 toks/s=206,760 tflops=492.24 mfu=24.87% step_ms=314.64 sm_util=92.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=40 loss=249.1610 pred=246.2209 aux=147.0088 lr=4.00e-06 toks/s=206,375 tflops=491.32 mfu=24.83% step_ms=315.19 sm_util=98.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=50 loss=212.6327 pred=209.6446 aux=149.4023 lr=5.00e-06 toks/s=208,379 tflops=496.09 mfu=25.07% step_ms=312.07 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=60 loss=189.6552 pred=186.5679 aux=154.3697 lr=6.00e-06 toks/s=207,351 tflops=493.64 mfu=24.94% step_ms=313.71 sm_util=82.0% hbm_util=51.0% mem_ctrl_util=51.0%
+step=70 loss=178.0448 pred=175.0500 aux=149.7425 lr=7.00e-06 toks/s=209,550 tflops=498.88 mfu=25.21% step_ms=310.51 sm_util=91.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=80 loss=157.8656 pred=154.8192 aux=152.3195 lr=8.00e-06 toks/s=207,699 tflops=494.47 mfu=24.99% step_ms=313.15 sm_util=90.0% hbm_util=62.0% mem_ctrl_util=62.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=58.54
+```
+
+Honestly option #2 is good enough so just going to stick with that.
+
+
+### Finally a batch size increase:
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 200 \
+  --epochs 1 \
+  --batch-size 22 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --num-expert-layers 1 \
+  --hidden-size 768 \
+  --n-head 12 \
+  --n-decoder-layers 12 \
+  --num-experts 8 \
+  --k 2 \
+  --num-expert-layers 1 \
+  --d-ff 3072 \
+  --d-expert 3072 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --compile
+
+```
+
+
+So just increased to 22, that's a good size increase!
+```
+params total=538.13M (538,130,793) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=264.5456 pred=261.5764 aux=148.4557 lr=1.00e-06 toks/s=41,265 tflops=98.24 mfu=4.96% step_ms=2025.03 sm_util=99.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=20 loss=253.4424 pred=250.4918 aux=147.5271 lr=2.00e-06 toks/s=220,477 tflops=524.89 mfu=26.52% step_ms=406.01 sm_util=85.0% hbm_util=54.0% mem_ctrl_util=54.0%
+step=30 loss=250.9666 pred=248.0139 aux=147.6335 lr=3.00e-06 toks/s=219,897 tflops=523.51 mfu=26.45% step_ms=406.99 sm_util=95.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=40 loss=216.1697 pred=213.1769 aux=149.6393 lr=4.00e-06 toks/s=218,993 tflops=521.36 mfu=26.34% step_ms=408.88 sm_util=86.0% hbm_util=55.0% mem_ctrl_util=55.0%
+step=50 loss=206.1311 pred=203.1387 aux=149.6241 lr=5.00e-06 toks/s=223,780 tflops=532.75 mfu=26.92% step_ms=400.04 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=60 loss=219.9569 pred=216.9866 aux=148.5134 lr=6.00e-06 toks/s=219,638 tflops=522.89 mfu=26.42% step_ms=407.63 sm_util=90.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=70 loss=198.2897 pred=195.3335 aux=147.8114 lr=7.00e-06 toks/s=219,289 tflops=522.06 mfu=26.38% step_ms=408.18 sm_util=99.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=80 loss=197.0481 pred=194.0903 aux=147.8908 lr=8.00e-06 toks/s=223,470 tflops=532.02 mfu=26.88% step_ms=400.47 sm_util=99.0% hbm_util=60.0% mem_ctrl_util=60.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=77.00
+```
 
 
 #### TODO
-- I need to reason about why the two MOE layers have different performance and why the "Efficient" one is much worse (half perf)
 - I need to figure out what other MOE frameworks do for this part of the network I'm trying to optimize

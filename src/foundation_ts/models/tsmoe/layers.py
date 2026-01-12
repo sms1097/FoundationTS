@@ -9,6 +9,12 @@ from torch.nn import functional as F
 from foundation_ts.models.tsmoe.stats import MoEStats
 
 torch.set_float32_matmul_precision("high")
+try:
+    import torch._dynamo as dynamo
+
+    dynamo.config.capture_scalar_outputs = True
+except Exception:
+    pass
 
 
 def _get_unpad_data(attention_mask):
@@ -329,9 +335,9 @@ class BatchedExperts(torch.nn.Module):
 
     def forward(self, x):
         # x: [E, C, H]
-        x = torch.einsum("ech,ehf->ecf", x, self.w1)
+        x = torch.bmm(x, self.w1)
         x = torch.nn.functional.gelu(x)
-        x = torch.einsum("ecf,efh->ech", x, self.w2)
+        x = torch.bmm(x, self.w2)
         return x
 
 
@@ -423,28 +429,41 @@ class EfficientMOELayer(nn.Module):
         keep = in_cap & nonzero
 
         # Scatter routes into the fixed [E, C, D] expert input buffer
-        expert_inputs = x_sorted.new_zeros((E, C, D))
-
         e_idx = expert_sorted
         p_idx = positions.clamp(min=0, max=C - 1)
-
         lin = e_idx * C + p_idx  # linear slot in [E*C]
         src = x_sorted * keep.to(x_sorted.dtype).unsqueeze(-1)
-        expert_inputs_flat = expert_inputs.view(E*C, D)
-        expert_inputs_flat.scatter_(0, lin.unsqueeze(-1).expand(-1, D), src)
+        expert_inputs_flat = x_sorted.new_zeros((E * C, D))
+        expert_inputs_flat = torch.scatter(
+            expert_inputs_flat, 0, lin.unsqueeze(-1).expand(-1, D), src
+        )
         expert_inputs = expert_inputs_flat.view(E, C, D)
 
         # Run experts and gather outputs back per route.
         expert_outputs = self.experts(expert_inputs)  # [E,C,D]
 
-        y_sorted = expert_outputs[e_idx, p_idx]  # [R,D]
+        # Invert route->slot mapping and scatter-add without index_select.
+        expert_outputs_flat = expert_outputs.view(E * C, D)
+        lin_valid = lin[keep]
+        token_valid = token_sorted[keep]
+        gate_valid = gate_sorted[keep]
 
-        y_sorted = y_sorted * keep.to(y_sorted.dtype).unsqueeze(-1)
-        y_sorted = y_sorted * gate_sorted.to(y_sorted.dtype).unsqueeze(-1)
+        slot_gate = x_sorted.new_zeros((E * C,))
+        slot_gate = torch.scatter(slot_gate, 0, lin_valid, gate_valid.to(slot_gate.dtype))
+        slot_token = torch.full((E * C,), -1, device=hidden_state.device, dtype=torch.long)
+        slot_token = torch.scatter(slot_token, 0, lin_valid, token_valid)
 
-        # Scatter-add route outputs back to token positions.
+        slot_outputs = expert_outputs_flat * slot_gate.unsqueeze(-1)
+        slot_mask = slot_token >= 0
+
+        # Scatter-add slot outputs back to token positions.
         y_out = x.new_zeros((N, D))
-        y_out.scatter_add_(0, token_sorted.unsqueeze(-1).expand(-1, D), y_sorted.to(y_out.dtype))
+        y_out = torch.scatter_add(
+            y_out,
+            0,
+            slot_token[slot_mask].unsqueeze(-1).expand(-1, D),
+            slot_outputs[slot_mask].to(y_out.dtype),
+        )
         y_out = y_out.reshape(B, T, D)
 
         # Add shared expert path weighted by the router's shared gate.
@@ -472,4 +491,3 @@ class EfficientMOELayer(nn.Module):
         stats.add_values_(importance, load)
 
         return y_out, stats
-

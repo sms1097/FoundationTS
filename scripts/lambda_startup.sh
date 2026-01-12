@@ -9,6 +9,8 @@ python3.12 -m venv ~/py312
 source ~/py312/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 
-pip install -e .
+pip install torch psutil
+pip install --no-build-isolation flash-attn
+pip install .
 
 foundationts data download

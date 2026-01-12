@@ -117,7 +117,7 @@ def _build_model(model_config, device: torch.device, max_batch_tokens: int) -> T
 def _maybe_compile_model(model, train_config):
     if not train_config.compile:
         return model
-    return torch.compile(model, mode="max-autotune")
+    return torch.compile(model)
 
 
 def _build_optimizer_scheduler(

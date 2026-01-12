@@ -164,7 +164,7 @@ def main() -> None:
     lengths = torch.linspace(min_len, SEQ_LEN, steps=BATCH_SIZE, device=device).round().to(torch.int32)
     positions = torch.arange(SEQ_LEN, device=device, dtype=torch.int32).unsqueeze(0)
     attention_mask = (positions < lengths.unsqueeze(1)).to(torch.int32)
-    attention_mask = None
+    # attention_mask = None
 
     efficient_layer = EfficientMOELayer(
         hidden_size=HIDDEN_SIZE,
@@ -200,20 +200,20 @@ def main() -> None:
         f"backward={RUN_BACKWARD}"
     )
     # Uncomment to benchmark torch.compile
-    # if not hasattr(torch, "compile"):
-    #     raise RuntimeError("torch.compile is required for the compiled MoE benchmark.")
-    # compiled_layer = torch.compile(
-    #     EfficientMOELayer(
-    #         hidden_size=HIDDEN_SIZE,
-    #         num_experts=NUM_EXPERTS,
-    #         k=TOP_K,
-    #         max_batch_tokens=max_batch_tokens,
-    #         d_ff=D_FF,
-    #         d_expert=D_EXPERT,
-    #         capacity_factor=CAPACITY_FACTOR,
-    #     ).to(device=device, dtype=dtype)
-    # )
-    # layers.insert(2, ("EfficientMOELayer (compiled)", compiled_layer))
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is required for the compiled MoE benchmark.")
+    compiled_layer = torch.compile(
+        EfficientMOELayer(
+            hidden_size=HIDDEN_SIZE,
+            num_experts=NUM_EXPERTS,
+            k=TOP_K,
+            max_batch_tokens=max_batch_tokens,
+            d_ff=D_FF,
+            d_expert=D_EXPERT,
+            capacity_factor=CAPACITY_FACTOR,
+        ).to(device=device, dtype=dtype)
+    )
+    layers.insert(2, ("EfficientMOELayer (compiled)", compiled_layer))
     for name, layer in layers:
         _run_layer(name, layer, x, attention_mask, use_amp=USE_BF16)
 

@@ -6,18 +6,11 @@ Install (editable)
 
 The runtime dependencies `torch`, `psutil`, and `flash-attn` must be installed in order; they are listed under the `runtime` extra in `pyproject.toml` but should be installed manually with `--no-build-isolation` for `flash-attn`.
 
-```bash
-pip install torch
-pip install psutil
-pip install --no-build-isolation flash-attn
-pip install -e .
-```
 
 Regular install:
 
 ```bash
-pip install torch
-pip install psutil
+pip install torch psutil
 pip install --no-build-isolation flash-attn
 pip install .
 ```
