@@ -1,4 +1,4 @@
-from foundation_ts.models.tsmoe.layers import Attention, AdaptiveMOELayer, EfficientMOELayer, MOELayer, RMSNorm
+from foundation_ts.models.tsmoe.layers import Attention, EfficientMOELayer, MOELayer, RMSNorm
 from foundation_ts.models.tsmoe.model import (
     TSMOE,
     MOEDecoderLayer,
@@ -8,7 +8,6 @@ from foundation_ts.models.tsmoe.model import (
 
 __all__ = [
     "Attention",
-    "AdaptiveMOELayer",
     "EfficientMOELayer",
     "MOEDecoderLayer",
     "MOELayer",

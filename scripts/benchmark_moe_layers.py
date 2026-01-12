@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from foundation_ts.models.tsmoe.layers import AdaptiveMOELayer, EfficientMOELayer, MOELayer
+from foundation_ts.models.tsmoe.layers import EfficientMOELayer, MOELayer
 from foundation_ts.models.tsmoe.stats import MoEStats
 
 # Hard-coded benchmark settings.
@@ -190,17 +190,6 @@ def main() -> None:
         (
             "EfficientMOELayer",
             efficient_layer,
-        ),
-        (
-            "AdaptiveMOELayer",
-            AdaptiveMOELayer(
-                hidden_size=HIDDEN_SIZE,
-                num_experts=NUM_EXPERTS,
-                k=TOP_K,
-                d_ff=D_FF,
-                d_expert=D_EXPERT,
-                capacity_factor=CAPACITY_FACTOR,
-            ).to(device=device, dtype=dtype),
         ),
     ]
 

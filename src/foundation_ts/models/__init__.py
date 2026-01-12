@@ -1,7 +1,6 @@
 from foundation_ts.models.tsmoe import (
     TSMOE,
     Attention,
-    AdaptiveMOELayer,
     MOEDecoderLayer,
     EfficientMOELayer,
     MOELayer,
@@ -12,7 +11,6 @@ from foundation_ts.models.tsmoe import (
 
 __all__ = [
     "Attention",
-    "AdaptiveMOELayer",
     "EfficientMOELayer",
     "MOEDecoderLayer",
     "MOELayer",

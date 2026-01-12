@@ -532,6 +532,28 @@ AdaptiveMOELayer
 
 So the attention mask just kills performance!
 
+I looked at some trace files for the MOE layers and found the issue. We spend 199ms in this kernel: 
+
+```
+void (anonymous namespace)::indexing_backward_kernel<c10::BFloat16, 4>(long const*, long const*, c10::BFloat16 const*, c10::BFloat16*, long, long, long, long, bool) 
+```
+
+This is caused by the attention mask altering a variable `expert_for_route`, which determines the indexing order for the expert layer input. To solve this, we just ned to change how we apply the mask. Right now we do something like this:
+
+
+```
+if attention_mask is not None:
+  ...
+  expert_for_route = torch.where(valid_route, expert_for_route, torch.zeros_like(expert_for_route))
+
+# do some more logic
+e_idx = expert_sorted
+p_idx = positions.clamp(min=0, max=C - 1)  # safe for dropped items; they'll be masked by `keep`
+expert_inputs[e_idx[keep], p_idx[keep]] = x_sorted[keep]
+```
+
+This works when the attention mask is not none, because keep is relatively deterministic
+
 
 #### TODO
 - I need to reason about why the two MOE layers have different performance and why the "Efficient" one is much worse (half perf)
