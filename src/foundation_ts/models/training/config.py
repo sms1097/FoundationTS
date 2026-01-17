@@ -26,6 +26,8 @@ class ModelConfig:
     n_head: int = 8
     d_ff: int | None = None
     d_expert: int | None = None
+    moe_m_tile: int = 1
+    capacity_factor: float = 1.3
     horizons: list[int] = field(default_factory=lambda: [1, 8, 32, 64])
     moe_impl: str = "efficient"
 

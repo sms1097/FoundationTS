@@ -72,8 +72,9 @@ class MOEDecoderLayer(nn.Module):
         k: int,
         d_ff: int | None = None,
         d_expert: int | None = None,
+        moe_m_tile: int = 1,
         max_batch_tokens: int | None = None,
-        capacity_factor: float = 1.25,
+        capacity_factor: float = 1.5,
         drop_policy: str = "drop",
         moe_impl: str = "efficient",
     ):
@@ -85,39 +86,22 @@ class MOEDecoderLayer(nn.Module):
 
         self.attention = Attention(hidden_size, n_head)
         self.rms_norm2 = RMSNorm(hidden_size)
-        if moe_impl == "efficient":
-            expert_layer = lambda: EfficientMOELayer(
-                hidden_size,
-                num_experts,
-                k,
-                max_batch_tokens=max_batch_tokens,
-                d_ff=d_ff,
-                d_expert=d_expert,
-                capacity_factor=capacity_factor,
-                drop_policy=drop_policy,
-            )
-        elif moe_impl == "standard":
-            expert_layer = lambda: MOELayer(
-                hidden_size,
-                num_experts,
-                k,
-                d_ff=d_ff,
-                d_expert=d_expert,
-            )
-        elif moe_impl == "megablocks":
-            from foundation_ts.models.tsmoe.megablocks import MegaBlocksMoELayer
-
-            expert_layer = lambda: MegaBlocksMoELayer(
-                hidden_size=hidden_size,
-                num_experts=num_experts,
-                k=k,
-                d_ff=d_ff,
-                d_expert=d_expert,
-            )
-        else:
-            raise ValueError(f"Unknown moe_impl: {moe_impl}")
-
-        self.expert_layers = nn.ModuleList([expert_layer() for _ in range(num_expert_layers)])
+        self.expert_layers = nn.ModuleList(
+            [
+                EfficientMOELayer(
+                    hidden_size,
+                    num_experts,
+                    k,
+                    moe_m_tile=moe_m_tile,
+                    max_batch_tokens=max_batch_tokens,
+                    d_ff=d_ff,
+                    d_expert=d_expert,
+                    capacity_factor=capacity_factor,
+                    drop_policy=drop_policy,
+                )
+                for _ in range(num_expert_layers)
+            ]
+        )
 
     def forward(
         self,
@@ -159,8 +143,9 @@ class TSMOE(nn.Module):
         patch_stride: int = 32,
         d_ff: int | None = None,
         d_expert: int | None = None,
+        moe_m_tile: int = 1,
         max_batch_tokens: int | None = None,
-        capacity_factor: float = 1.25,
+        capacity_factor: float = 1.5,
         drop_policy: str = "drop",
         moe_impl: str = "efficient",
     ):
@@ -179,6 +164,7 @@ class TSMOE(nn.Module):
                 k,
                 d_ff=d_ff,
                 d_expert=d_expert,
+                moe_m_tile=moe_m_tile,
                 max_batch_tokens=max_batch_tokens,
                 capacity_factor=capacity_factor,
                 drop_policy=drop_policy,

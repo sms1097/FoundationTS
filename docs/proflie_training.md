@@ -783,14 +783,11 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=77.00
 ## Next Day
 I'm making some changes to more closely match the implementation from Time-MOE. Here's what I changed:
 
-- Attention has separate q,k,v projections instead of one qkv proj
-- Added gate_proj
-
-Attention: split qkv_proj into q_proj, k_proj, v_proj, keep o_proj in layers.py.
-MoE experts: switched to gate_proj/up_proj/down_proj (SiLU), and set defaults to d_ff = 4 * hidden_size, d_expert = d_ff // k in layers.py.
-Output heads: now emit horizon * input_size per head in model.py.
-Embedding: input size now honors input_size (and patch_len * input_size when patched) in model.py.
-Model config: added input_size to CLI/config and pass-through in config.py, cli.py, loop.py.
+- Attention: split qkv_proj into q_proj, k_proj, v_proj, keep o_proj in layers.py.
+- MoE experts: switched to gate_proj/up_proj/down_proj (SiLU), and set defaults to d_ff = 4 * hidden_size, d_expert = d_ff // k in layers.py.
+- Output heads: now emit horizon * input_size per head in model.py.
+- Embedding: input size now honors input_size (and patch_len * input_size when patched) in model.py.
+- Model config: added input_size to CLI/config and pass-through in config.py, cli.py, loop.py.
 
 New Command:
 ```
@@ -1067,31 +1064,300 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.29 kernels/step=1
 Okay so Sequence Packing isn't worth the extra engineering effort to try to figure out why all of these kernels are being launched. 
 
 
-## Trying Megablocks
+## Next Day
+There's a bug with how I'm calculating capacity. Here is the diff:
+
 
 ```
-foundationts train \
-  --dataset-path time300b_selected \
-  --steps-per-epoch 80 \
-  --epochs 1 \
-  --batch-size 18 \
-  --seq-max-len 4096 \
-  --seq-stride 4096 \
-  --hidden-size 768 \
-  --n-decoder-layers 12 \
-  --n-head 12 \
-  --num-experts 8 \
-  --k 2 \
-  --d-ff 3072 \
-  --d-expert 1536 \
-  --log-every 10 \
-  --checkpoint-every 0 \
-  --log-perf-metrics \
-  --mfu-peak-tflops 1979 \
-  --moe-impl megablocks \
-  --compile
+         e_idx = expert_sorted
+         p_idx = positions.clamp(min=0, max=C - 1)
+         lin = e_idx * C + p_idx  # linear slot in [E*C]
+-        src = x_sorted * keep.to(x_sorted.dtype).unsqueeze(-1)
++
++        lin_valid = lin[keep]
++        src_valid = x_sorted[keep]
++
+         expert_inputs_flat = x_sorted.new_zeros((E * C, D))
+-        expert_inputs_flat = torch.scatter(
+-            expert_inputs_flat, 0, lin.unsqueeze(-1).expand(-1, D), src
+-        )
++        expert_inputs_flat.scatter_(0, lin_valid[:, None].expand(-1, D), src_valid)
+         expert_inputs = expert_inputs_flat.view(E, C, D)
+ 
+         # Run experts and gather outputs back per route.
 ```
 
 
-## Other things to try
-- I need to figure out what other MOE frameworks do for this part of the network I'm trying to optimize
+```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --compile
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5714.7065 pred=5711.7275 aux=148.9415 lr=1.00e-06 toks/s=39,978 tflops=95.18 mfu=4.81% step_ms=2105.83 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=20 loss=5757.9424 pred=5754.9678 aux=148.7356 lr=2.00e-06 toks/s=219,988 tflops=523.73 mfu=26.46% step_ms=407.89 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=30 loss=5809.2651 pred=5806.2856 aux=148.9866 lr=3.00e-06 toks/s=222,178 tflops=528.94 mfu=26.73% step_ms=403.79 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=40 loss=5754.1855 pred=5751.2173 aux=148.4094 lr=4.00e-06 toks/s=223,266 tflops=531.53 mfu=26.86% step_ms=401.75 sm_util=97.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=50 loss=5711.2402 pred=5708.2461 aux=149.7059 lr=5.00e-06 toks/s=221,638 tflops=527.65 mfu=26.66% step_ms=404.82 sm_util=93.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=60 loss=5781.4434 pred=5778.4858 aux=147.8750 lr=6.00e-06 toks/s=219,441 tflops=522.42 mfu=26.40% step_ms=408.94 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=70 loss=5613.3340 pred=5610.3887 aux=147.2765 lr=7.00e-06 toks/s=226,965 tflops=540.34 mfu=27.30% step_ms=395.24 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=80 loss=5644.0732 pred=5641.1084 aux=148.2337 lr=8.00e-06 toks/s=222,678 tflops=530.13 mfu=26.79% step_ms=402.93 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.16
+```
+
+
+### Trying Grouped GEMM over Batched MM
+I'm going to removing the BMM with a single matmul, since we have fixed capacity now.
+
+
+```
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5862.3252 pred=5859.3149 aux=150.5065 lr=1.00e-06 toks/s=47,730 tflops=113.63 mfu=5.74% step_ms=1749.83 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=20 loss=5787.9414 pred=5784.9849 aux=147.8340 lr=2.00e-06 toks/s=152,709 tflops=363.55 mfu=18.37% step_ms=588.38 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=30 loss=5791.8892 pred=5788.9092 aux=149.0090 lr=3.00e-06 toks/s=153,615 tflops=365.71 mfu=18.48% step_ms=584.99 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=40 loss=5816.6387 pred=5813.7070 aux=146.5937 lr=4.00e-06 toks/s=150,134 tflops=357.42 mfu=18.06% step_ms=598.70 sm_util=99.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=50 loss=5774.9844 pred=5771.9956 aux=149.4340 lr=5.00e-06 toks/s=152,662 tflops=363.44 mfu=18.37% step_ms=588.54 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=60 loss=5870.4336 pred=5867.4805 aux=147.6672 lr=6.00e-06 toks/s=153,347 tflops=365.07 mfu=18.45% step_ms=586.04 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=70 loss=5766.1392 pred=5763.1636 aux=148.7864 lr=7.00e-06 toks/s=152,464 tflops=362.97 mfu=18.34% step_ms=589.32 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=80 loss=5668.5630 pred=5665.5996 aux=148.1573 lr=8.00e-06 toks/s=155,015 tflops=369.05 mfu=18.65% step_ms=579.67 sm_util=99.0% hbm_util=64.0% mem_ctrl_util=64.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=77.29
+```
+
+That's a big drop on MFU, but `sm_util` stays really high, I really want to know how many kernels this launches.
+
+```
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5838.4888 pred=5835.4766 aux=150.6215 lr=1.00e-06 toks/s=65,393 tflops=155.68 mfu=7.87% step_ms=1244.45 sm_util=99.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=20 loss=5778.5908 pred=5775.6284 aux=148.1096 lr=2.00e-06 toks/s=155,125 tflops=369.31 mfu=18.66% step_ms=580.34 sm_util=99.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=30 loss=5795.1992 pred=5792.2061 aux=149.6616 lr=3.00e-06 toks/s=133,432 tflops=317.66 mfu=16.05% step_ms=576.60 sm_util=99.0% hbm_util=68.0% mem_ctrl_util=68.0% kernels/step=900.6
+step=40 loss=5840.8833 pred=5837.9482 aux=146.7554 lr=4.00e-06 toks/s=86,088 tflops=204.95 mfu=10.36% step_ms=583.31 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=50 loss=5768.9014 pred=5765.9111 aux=149.5125 lr=5.00e-06 toks/s=154,632 tflops=368.13 mfu=18.60% step_ms=574.92 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=60 loss=5884.1382 pred=5881.1924 aux=147.3007 lr=6.00e-06 toks/s=154,449 tflops=367.70 mfu=18.58% step_ms=575.64 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=70 loss=5774.7158 pred=5771.7852 aux=146.5394 lr=7.00e-06 toks/s=152,636 tflops=363.38 mfu=18.36% step_ms=582.30 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=80 loss=5670.2783 pred=5667.3462 aux=146.6033 lr=8.00e-06 toks/s=155,632 tflops=370.51 mfu=18.72% step_ms=570.84 sm_util=99.0% hbm_util=64.0% mem_ctrl_util=64.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=77.29 kernels/step=900.6
+```
+Yikes, that's pretty bad. 
+
+The “fused op” idea is a grouped 1x1 Conv1d implementation: we reshape [E,C,H] into [1, E*H, C] and used groups=E so a single conv call performs all experts’ linear projections with fixed shapes. That can work because grouped 1x1 conv is equivalent to per‑expert matmul, and in some backends it lowers to a single larger GEMM or more compiler‑friendly kernel. It might have helped by reducing dynamic shapes and making compilation/kernel selection simpler — but in this run it ended up launching many more kernels.
+
+
+### Token Rounding
+
+
+```
+((py312) ) ubuntu@192-222-55-188:~/FoundationTS$ foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --compile --moe-m-tile 128
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5685.3545 pred=5682.1230 aux=161.5728 lr=1.00e-06 toks/s=55,049 tflops=131.05 mfu=6.62% step_ms=1473.55 sm_util=98.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=20 loss=5704.7617 pred=5701.5566 aux=160.2583 lr=2.00e-06 toks/s=220,479 tflops=524.89 mfu=26.52% step_ms=407.23 sm_util=83.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=30 loss=5812.3931 pred=5809.2720 aux=156.0482 lr=3.00e-06 toks/s=221,802 tflops=528.05 mfu=26.68% step_ms=404.51 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=40 loss=5768.9258 pred=5765.8037 aux=156.1004 lr=4.00e-06 toks/s=223,781 tflops=532.76 mfu=26.92% step_ms=400.82 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=50 loss=5728.0068 pred=5724.8354 aux=158.5806 lr=5.00e-06 toks/s=221,416 tflops=527.13 mfu=26.64% step_ms=405.22 sm_util=90.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=60 loss=5714.3804 pred=5711.2510 aux=156.4693 lr=6.00e-06 toks/s=219,507 tflops=522.58 mfu=26.41% step_ms=408.69 sm_util=87.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=70 loss=5561.7061 pred=5558.4844 aux=161.0790 lr=7.00e-06 toks/s=227,722 tflops=542.14 mfu=27.39% step_ms=393.92 sm_util=92.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=80 loss=5648.5649 pred=5645.4238 aux=157.0536 lr=8.00e-06 toks/s=223,646 tflops=532.44 mfu=26.90% step_ms=401.20 sm_util=90.0% hbm_util=59.0% mem_ctrl_util=59.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.30
+```
+
+It doesn't make a difference. I want to see what kind of difference capacity factor makes:
+```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979 --moe-m-tile 128 --compile --capacity-factor 1.5
+
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5921.3550 pred=5918.3101 aux=152.2528 lr=1.00e-06 toks/s=46,723 tflops=111.23 mfu=5.62% step_ms=1592.75 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=20 loss=5694.6294 pred=5691.4116 aux=160.8899 lr=2.00e-06 toks/s=206,130 tflops=490.73 mfu=24.80% step_ms=395.69 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=30 loss=5845.6533 pred=5842.5303 aux=156.1550 lr=3.00e-06 toks/s=211,428 tflops=503.35 mfu=25.43% step_ms=385.97 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=40 loss=5700.0518 pred=5696.8218 aux=161.4991 lr=4.00e-06 toks/s=205,221 tflops=488.57 mfu=24.69% step_ms=397.53 sm_util=88.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=50 loss=5700.0317 pred=5696.8970 aux=156.7410 lr=5.00e-06 toks/s=208,861 tflops=497.24 mfu=25.13% step_ms=390.44 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=60 loss=5579.6064 pred=5576.4004 aux=160.2964 lr=6.00e-06 toks/s=207,413 tflops=493.79 mfu=24.95% step_ms=393.19 sm_util=85.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=70 loss=5544.9438 pred=5541.7334 aux=160.5317 lr=7.00e-06 toks/s=207,518 tflops=494.04 mfu=24.96% step_ms=393.04 sm_util=97.0% hbm_util=70.0% mem_ctrl_util=70.0%
+step=80 loss=5619.4175 pred=5616.3027 aux=155.7427 lr=8.00e-06 toks/s=208,892 tflops=497.31 mfu=25.13% step_ms=390.60 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.05
+```
+
+
+
+```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979 --moe-m-tile 128 --compile --capacity-factor 1.1
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5704.0186 pred=5700.7891 aux=161.4736 lr=1.00e-06 toks/s=58,163 tflops=138.47 mfu=7.00% step_ms=1392.21 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=20 loss=5941.6650 pred=5938.4463 aux=160.9367 lr=2.00e-06 toks/s=227,899 tflops=542.56 mfu=27.42% step_ms=393.68 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=30 loss=5816.5107 pred=5813.3936 aux=155.8695 lr=3.00e-06 toks/s=230,047 tflops=547.67 mfu=27.67% step_ms=389.95 sm_util=87.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=40 loss=5722.0522 pred=5718.9180 aux=156.7047 lr=4.00e-06 toks/s=230,510 tflops=548.78 mfu=27.73% step_ms=389.05 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=50 loss=5713.4688 pred=5710.3086 aux=158.0142 lr=5.00e-06 toks/s=228,207 tflops=543.29 mfu=27.45% step_ms=393.08 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=60 loss=5613.9873 pred=5610.7930 aux=159.7135 lr=6.00e-06 toks/s=179,653 tflops=427.70 mfu=21.61% step_ms=499.79 sm_util=83.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=70 loss=5533.1533 pred=5529.9326 aux=161.0394 lr=7.00e-06 toks/s=235,687 tflops=561.10 mfu=28.35% step_ms=380.55 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=80 loss=5538.1479 pred=5534.9746 aux=158.6701 lr=8.00e-06 toks/s=231,288 tflops=550.63 mfu=27.82% step_ms=387.69 sm_util=88.0% hbm_util=58.0% mem_ctrl_util=58.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=71.04
+```
+
+
+```
+ foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 24   --seq-max-len 4096   --seq-strid
+e 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-p
+eak-tflops 1979 --moe-m-tile 128 --compile --capacity-factor 0.9
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5794.5264 pred=5791.4209 aux=155.2703 lr=1.00e-06 toks/s=42,325 tflops=100.76 mfu=5.09% step_ms=2161.24 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=20 loss=5675.9614 pred=5672.7734 aux=159.3875 lr=2.00e-06 toks/s=239,843 tflops=570.99 mfu=28.85% step_ms=408.05 sm_util=90.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=30 loss=5789.0942 pred=5785.9863 aux=155.3979 lr=3.00e-06 toks/s=240,802 tflops=573.28 mfu=28.97% step_ms=406.39 sm_util=99.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=40 loss=5646.1543 pred=5642.8652 aux=164.4464 lr=4.00e-06 toks/s=245,888 tflops=585.39 mfu=29.58% step_ms=397.94 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=50 loss=5622.1694 pred=5618.9629 aux=160.3261 lr=5.00e-06 toks/s=240,137 tflops=571.70 mfu=28.89% step_ms=407.42 sm_util=90.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=60 loss=5537.4404 pred=5534.1572 aux=164.1706 lr=6.00e-06 toks/s=242,876 tflops=578.22 mfu=29.22% step_ms=402.90 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=70 loss=5624.0742 pred=5620.9307 aux=157.1815 lr=7.00e-06 toks/s=243,383 tflops=579.42 mfu=29.28% step_ms=402.00 sm_util=86.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=80 loss=5461.6753 pred=5458.3989 aux=163.8270 lr=8.00e-06 toks/s=243,059 tflops=578.65 mfu=29.24% step_ms=402.54 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=72.91
+```
+
+
+
+## Lmao, changing MFU calculation
+
+I was using the wrong theoretical tflops, because I don't exploit sparsity. My actual max tflops are 989, and I added a function estimate how many flops my model is doing per pass.
+
+```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 200   --epochs 1   --batch-size 24   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 989 --moe-m-tile 64 --compile --capacity-factor 0.9
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5810.2383 pred=5807.1323 aux=155.2937 lr=1.00e-06 toks/s=80,250 tflops=127.77 mfu=12.92% step_ms=1057.48 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=20 loss=5718.8608 pred=5715.6758 aux=159.2422 lr=2.00e-06 toks/s=237,581 tflops=378.26 mfu=38.25% step_ms=412.04 sm_util=88.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=30 loss=5778.2363 pred=5775.1421 aux=154.7197 lr=3.00e-06 toks/s=238,892 tflops=380.34 mfu=38.46% step_ms=409.76 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=40 loss=5646.9473 pred=5643.6606 aux=164.3323 lr=4.00e-06 toks/s=244,518 tflops=389.30 mfu=39.36% step_ms=400.27 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=50 loss=5631.3750 pred=5628.1675 aux=160.3664 lr=5.00e-06 toks/s=238,203 tflops=379.25 mfu=38.35% step_ms=410.85 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=60 loss=5596.4663 pred=5593.1494 aux=165.8363 lr=6.00e-06 toks/s=240,030 tflops=382.15 mfu=38.64% step_ms=407.83 sm_util=91.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=70 loss=5633.7559 pred=5630.6226 aux=156.6655 lr=7.00e-06 toks/s=243,368 tflops=387.47 mfu=39.18% step_ms=402.23 sm_util=89.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=80 loss=5488.2505 pred=5484.9912 aux=162.9748 lr=8.00e-06 toks/s=242,778 tflops=386.53 mfu=39.08% step_ms=403.14 sm_util=97.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=90 loss=5628.0044 pred=5624.9395 aux=153.2491 lr=9.00e-06 toks/s=241,032 tflops=383.75 mfu=38.80% step_ms=406.00 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=100 loss=5419.8745 pred=5416.7046 aux=158.4884 lr=1.00e-05 toks/s=245,035 tflops=390.12 mfu=39.45% step_ms=399.37 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=110 loss=5267.5776 pred=5264.3809 aux=159.8483 lr=1.10e-05 toks/s=241,890 tflops=385.12 mfu=38.94% step_ms=404.50 sm_util=87.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=120 loss=5112.1431 pred=5108.9219 aux=161.0677 lr=1.20e-05 toks/s=247,385 tflops=393.87 mfu=39.82% step_ms=395.47 sm_util=89.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=130 loss=5209.6396 pred=5206.4927 aux=157.3450 lr=1.30e-05 toks/s=237,649 tflops=378.36 mfu=38.26% step_ms=411.89 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=140 loss=5085.7231 pred=5082.4634 aux=162.9875 lr=1.40e-05 toks/s=244,175 tflops=388.75 mfu=39.31% step_ms=400.81 sm_util=93.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=150 loss=5061.4946 pred=5058.3101 aux=159.2247 lr=1.50e-05 toks/s=241,303 tflops=384.18 mfu=38.85% step_ms=405.63 sm_util=84.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=160 loss=4861.8677 pred=4858.6875 aux=159.0014 lr=1.60e-05 toks/s=244,385 tflops=389.09 mfu=39.34% step_ms=400.47 sm_util=84.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=170 loss=4824.0610 pred=4820.9551 aux=155.3020 lr=1.70e-05 toks/s=242,515 tflops=386.11 mfu=39.04% step_ms=403.68 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=180 loss=4761.2358 pred=4758.1802 aux=152.7898 lr=1.80e-05 toks/s=238,334 tflops=379.45 mfu=38.37% step_ms=410.69 sm_util=90.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=190 loss=4424.8398 pred=4421.6089 aux=161.5480 lr=1.90e-05 toks/s=242,044 tflops=385.36 mfu=38.96% step_ms=404.14 sm_util=86.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=200 loss=4447.7373 pred=4444.5767 aux=158.0322 lr=2.00e-05 toks/s=243,534 tflops=387.73 mfu=39.20% step_ms=401.73 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=72.45
+```
+
+
+
+## Correctness check:
+
+```
+((py312) ) ubuntu@192-222-55-188:~/FoundationTS$ foundationts train   --dataset-path time300b_selected   --steps-per-epoch 1000   --epo
+chs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-expert
+s 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 989 --moe-
+m-tile 64 --compile --capacity-factor 1.25
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5699.4336 pred=5696.2012 aux=161.6187 lr=1.00e-06 toks/s=73,422 tflops=129.99 mfu=13.14% step_ms=1061.18 sm_util=98.0% hbm_util=69.0% mem_ctrl_util=69.0%
+step=20 loss=5784.9434 pred=5781.7437 aux=159.9814 lr=2.00e-06 toks/s=220,900 tflops=391.09 mfu=39.54% step_ms=406.21 sm_util=83.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=30 loss=5823.4453 pred=5820.3174 aux=156.3893 lr=3.00e-06 toks/s=223,067 tflops=394.93 mfu=39.93% step_ms=402.21 sm_util=86.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=40 loss=5816.1714 pred=5813.0439 aux=156.3684 lr=4.00e-06 toks/s=223,921 tflops=396.44 mfu=40.09% step_ms=400.59 sm_util=88.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=50 loss=5720.4209 pred=5717.2344 aux=159.3245 lr=5.00e-06 toks/s=222,360 tflops=393.68 mfu=39.81% step_ms=403.49 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=60 loss=5704.9536 pred=5701.7988 aux=157.7492 lr=6.00e-06 toks/s=220,035 tflops=389.56 mfu=39.39% step_ms=407.72 sm_util=93.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=70 loss=5570.0225 pred=5566.8140 aux=160.4364 lr=7.00e-06 toks/s=228,194 tflops=404.01 mfu=40.85% step_ms=393.11 sm_util=98.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=80 loss=5634.0210 pred=5630.8721 aux=157.4379 lr=8.00e-06 toks/s=223,562 tflops=395.81 mfu=40.02% step_ms=401.31 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=90 loss=5666.5781 pred=5663.4775 aux=155.0228 lr=9.00e-06 toks/s=222,034 tflops=393.10 mfu=39.75% step_ms=404.04 sm_util=92.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=100 loss=5446.0269 pred=5442.7588 aux=163.4049 lr=1.00e-05 toks/s=223,164 tflops=395.10 mfu=39.95% step_ms=401.94 sm_util=83.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=110 loss=5404.6831 pred=5401.5254 aux=157.8755 lr=1.10e-05 toks/s=225,546 tflops=399.32 mfu=40.38% step_ms=397.81 sm_util=84.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=120 loss=5574.6748 pred=5571.6523 aux=151.1198 lr=1.20e-05 toks/s=222,147 tflops=393.30 mfu=39.77% step_ms=403.80 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=130 loss=5405.9023 pred=5402.8462 aux=152.8198 lr=1.30e-05 toks/s=226,481 tflops=400.98 mfu=40.54% step_ms=396.06 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=140 loss=5182.5557 pred=5179.4243 aux=156.5585 lr=1.40e-05 toks/s=219,239 tflops=388.15 mfu=39.25% step_ms=409.18 sm_util=92.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=150 loss=5327.5771 pred=5324.5625 aux=150.7379 lr=1.50e-05 toks/s=222,397 tflops=393.74 mfu=39.81% step_ms=403.36 sm_util=86.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=160 loss=5321.3237 pred=5318.3223 aux=150.0620 lr=1.60e-05 toks/s=222,149 tflops=393.31 mfu=39.77% step_ms=403.88 sm_util=97.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=170 loss=4689.5181 pred=4686.2363 aux=164.0910 lr=1.70e-05 toks/s=225,372 tflops=399.01 mfu=40.35% step_ms=397.96 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=180 loss=4886.7715 pred=4883.6382 aux=156.6661 lr=1.80e-05 toks/s=225,184 tflops=398.68 mfu=40.31% step_ms=398.42 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=190 loss=4614.6328 pred=4611.4521 aux=159.0338 lr=1.90e-05 toks/s=224,435 tflops=397.35 mfu=40.18% step_ms=399.68 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=200 loss=4769.3843 pred=4766.3506 aux=151.6758 lr=2.00e-05 toks/s=218,539 tflops=386.92 mfu=39.12% step_ms=410.59 sm_util=89.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=210 loss=4679.8340 pred=4676.8154 aux=150.9385 lr=2.10e-05 toks/s=222,954 tflops=394.73 mfu=39.91% step_ms=402.31 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=220 loss=4337.3022 pred=4334.1694 aux=156.6346 lr=2.20e-05 toks/s=224,502 tflops=397.47 mfu=40.19% step_ms=399.60 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=230 loss=4258.0498 pred=4255.0098 aux=151.9912 lr=2.30e-05 toks/s=222,194 tflops=393.39 mfu=39.78% step_ms=403.67 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=240 loss=4304.5454 pred=4301.5190 aux=151.3144 lr=2.40e-05 toks/s=222,673 tflops=394.23 mfu=39.86% step_ms=402.85 sm_util=93.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=250 loss=3899.8667 pred=3896.7329 aux=156.6869 lr=2.50e-05 toks/s=220,660 tflops=390.67 mfu=39.50% step_ms=406.62 sm_util=85.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=260 loss=4344.7314 pred=4341.7793 aux=147.6096 lr=2.60e-05 toks/s=223,450 tflops=395.61 mfu=40.00% step_ms=401.53 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=270 loss=3671.2419 pred=3668.1086 aux=156.6688 lr=2.70e-05 toks/s=222,922 tflops=394.67 mfu=39.91% step_ms=402.50 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=280 loss=3601.3774 pred=3598.2979 aux=153.9836 lr=2.80e-05 toks/s=223,342 tflops=395.42 mfu=39.98% step_ms=401.80 sm_util=93.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=290 loss=3651.3320 pred=3648.1746 aux=157.8784 lr=2.90e-05 toks/s=223,149 tflops=395.08 mfu=39.95% step_ms=402.08 sm_util=86.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=300 loss=3381.5122 pred=3378.1963 aux=165.7950 lr=3.00e-05 toks/s=221,201 tflops=391.63 mfu=39.60% step_ms=405.71 sm_util=84.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=310 loss=3012.9758 pred=3009.7202 aux=162.7803 lr=3.10e-05 toks/s=224,485 tflops=397.44 mfu=40.19% step_ms=399.85 sm_util=87.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=320 loss=2720.7036 pred=2717.3208 aux=169.1390 lr=3.20e-05 toks/s=227,032 tflops=401.95 mfu=40.64% step_ms=395.27 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=330 loss=3062.9570 pred=3059.5510 aux=170.2958 lr=3.30e-05 toks/s=226,141 tflops=400.37 mfu=40.48% step_ms=396.86 sm_util=81.0% hbm_util=55.0% mem_ctrl_util=55.0%
+step=340 loss=3063.4570 pred=3060.2266 aux=161.5252 lr=3.40e-05 toks/s=221,058 tflops=391.37 mfu=39.57% step_ms=405.97 sm_util=98.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=350 loss=3788.5864 pred=3785.2615 aux=166.2507 lr=3.50e-05 toks/s=221,895 tflops=392.86 mfu=39.72% step_ms=404.28 sm_util=98.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=360 loss=2653.1885 pred=2649.8250 aux=168.1761 lr=3.60e-05 toks/s=228,619 tflops=404.76 mfu=40.93% step_ms=392.51 sm_util=98.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=370 loss=2560.9158 pred=2557.5981 aux=165.8758 lr=3.70e-05 toks/s=222,580 tflops=394.07 mfu=39.85% step_ms=403.21 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=380 loss=1854.7446 pred=1851.2743 aux=173.5165 lr=3.80e-05 toks/s=226,164 tflops=400.42 mfu=40.49% step_ms=396.73 sm_util=98.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=390 loss=2068.5515 pred=2065.2815 aux=163.5003 lr=3.90e-05 toks/s=224,591 tflops=397.63 mfu=40.21% step_ms=399.50 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=400 loss=2390.9475 pred=2387.6926 aux=162.7434 lr=4.00e-05 toks/s=223,602 tflops=395.88 mfu=40.03% step_ms=401.27 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=410 loss=1284.8772 pred=1281.5583 aux=165.9419 lr=4.10e-05 toks/s=228,052 tflops=403.76 mfu=40.82% step_ms=393.37 sm_util=98.0% hbm_util=70.0% mem_ctrl_util=70.0%
+step=420 loss=1922.4474 pred=1919.2623 aux=159.2512 lr=4.20e-05 toks/s=222,751 tflops=394.37 mfu=39.88% step_ms=402.90 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=430 loss=2119.8450 pred=2116.6113 aux=161.6814 lr=4.30e-05 toks/s=222,560 tflops=394.03 mfu=39.84% step_ms=403.03 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=440 loss=2093.0957 pred=2090.0513 aux=152.2259 lr=4.40e-05 toks/s=228,993 tflops=405.42 mfu=40.99% step_ms=391.71 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=450 loss=1670.7167 pred=1667.5272 aux=159.4710 lr=4.50e-05 toks/s=222,853 tflops=394.55 mfu=39.89% step_ms=402.49 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=460 loss=1707.0947 pred=1704.0236 aux=153.5566 lr=4.60e-05 toks/s=225,503 tflops=399.25 mfu=40.37% step_ms=397.84 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=470 loss=1134.1415 pred=1130.9937 aux=157.3930 lr=4.70e-05 toks/s=222,898 tflops=394.63 mfu=39.90% step_ms=402.57 sm_util=93.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=480 loss=528.0311 pred=524.7496 aux=164.0758 lr=4.80e-05 toks/s=181,042 tflops=320.53 mfu=32.41% step_ms=495.92 sm_util=92.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=490 loss=765.3400 pred=762.0929 aux=162.3568 lr=4.90e-05 toks/s=223,996 tflops=396.58 mfu=40.10% step_ms=400.59 sm_util=92.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=500 loss=1054.4230 pred=1051.3120 aux=155.5469 lr=5.00e-05 toks/s=221,178 tflops=391.59 mfu=39.59% step_ms=405.70 sm_util=82.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=510 loss=2397.5247 pred=2394.4832 aux=152.0752 lr=5.10e-05 toks/s=219,112 tflops=387.93 mfu=39.22% step_ms=409.56 sm_util=95.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=520 loss=1021.7197 pred=1018.5056 aux=160.7013 lr=5.20e-05 toks/s=224,895 tflops=398.17 mfu=40.26% step_ms=399.03 sm_util=91.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=530 loss=851.9277 pred=848.6572 aux=163.5245 lr=5.30e-05 toks/s=220,409 tflops=390.23 mfu=39.46% step_ms=407.21 sm_util=84.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=540 loss=1978.7312 pred=1975.4739 aux=162.8687 lr=5.40e-05 toks/s=221,264 tflops=391.74 mfu=39.61% step_ms=405.57 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=550 loss=1929.6866 pred=1926.6002 aux=154.3187 lr=5.50e-05 toks/s=216,977 tflops=384.15 mfu=38.84% step_ms=413.55 sm_util=86.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=560 loss=726.2624 pred=722.9949 aux=163.3771 lr=5.60e-05 toks/s=229,098 tflops=405.61 mfu=41.01% step_ms=391.51 sm_util=85.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=570 loss=1085.3627 pred=1082.2006 aux=158.1076 lr=5.70e-05 toks/s=225,276 tflops=398.84 mfu=40.33% step_ms=398.29 sm_util=87.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=580 loss=100.0261 pred=96.5609 aux=173.2594 lr=5.80e-05 toks/s=224,913 tflops=398.20 mfu=40.26% step_ms=398.86 sm_util=86.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=590 loss=169.2881 pred=166.1154 aux=158.6370 lr=5.90e-05 toks/s=223,234 tflops=395.23 mfu=39.96% step_ms=402.10 sm_util=84.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=600 loss=297.5385 pred=294.3382 aux=160.0189 lr=6.00e-05 toks/s=229,321 tflops=406.00 mfu=41.05% step_ms=391.21 sm_util=89.0% hbm_util=60.0% mem_ctrl_util=60.0%
+step=610 loss=125.5840 pred=122.4160 aux=158.4019 lr=6.10e-05 toks/s=220,288 tflops=390.01 mfu=39.43% step_ms=407.32 sm_util=86.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=620 loss=129.1823 pred=125.9798 aux=160.1221 lr=6.20e-05 toks/s=225,932 tflops=400.00 mfu=40.45% step_ms=397.02 sm_util=84.0% hbm_util=55.0% mem_ctrl_util=55.0%
+step=630 loss=254.7453 pred=251.5730 aux=158.6156 lr=6.30e-05 toks/s=226,933 tflops=401.78 mfu=40.62% step_ms=395.17 sm_util=85.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=640 loss=670.1309 pred=667.0147 aux=155.8092 lr=6.40e-05 toks/s=227,962 tflops=403.60 mfu=40.81% step_ms=393.47 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=650 loss=152.1122 pred=148.8190 aux=164.6629 lr=6.50e-05 toks/s=225,865 tflops=399.89 mfu=40.43% step_ms=397.07 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=660 loss=417.3076 pred=414.1596 aux=157.3998 lr=6.60e-05 toks/s=221,563 tflops=392.27 mfu=39.66% step_ms=404.85 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=670 loss=237.4961 pred=234.2534 aux=162.1338 lr=6.70e-05 toks/s=219,996 tflops=389.49 mfu=39.38% step_ms=407.75 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=680 loss=90.1067 pred=86.7016 aux=170.2560 lr=6.80e-05 toks/s=225,195 tflops=398.70 mfu=40.31% step_ms=398.33 sm_util=97.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=690 loss=182.5011 pred=179.1408 aux=168.0150 lr=6.90e-05 toks/s=227,078 tflops=402.03 mfu=40.65% step_ms=395.17 sm_util=88.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=700 loss=234.0364 pred=230.6399 aux=169.8267 lr=7.00e-05 toks/s=231,566 tflops=409.98 mfu=41.45% step_ms=387.34 sm_util=98.0% hbm_util=69.0% mem_ctrl_util=69.0%
+step=710 loss=79.5619 pred=76.2547 aux=165.3598 lr=7.10e-05 toks/s=225,575 tflops=399.37 mfu=40.38% step_ms=397.78 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=720 loss=66.8612 pred=63.5855 aux=163.7833 lr=7.20e-05 toks/s=227,678 tflops=403.10 mfu=40.76% step_ms=393.94 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=730 loss=137.3790 pred=134.1598 aux=160.9600 lr=7.30e-05 toks/s=224,543 tflops=397.54 mfu=40.20% step_ms=399.54 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=740 loss=343.2557 pred=340.1891 aux=153.3291 lr=7.40e-05 toks/s=226,540 tflops=401.08 mfu=40.55% step_ms=396.02 sm_util=84.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=750 loss=45.0012 pred=41.7336 aux=163.3813 lr=7.50e-05 toks/s=225,921 tflops=399.98 mfu=40.44% step_ms=397.02 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=760 loss=66.2866 pred=63.1181 aux=158.4252 lr=7.60e-05 toks/s=223,711 tflops=396.07 mfu=40.05% step_ms=400.91 sm_util=86.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=770 loss=155.2746 pred=152.1369 aux=156.8853 lr=7.70e-05 toks/s=229,764 tflops=406.79 mfu=41.13% step_ms=390.34 sm_util=90.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=780 loss=91.9211 pred=88.7623 aux=157.9399 lr=7.80e-05 toks/s=222,301 tflops=393.58 mfu=39.80% step_ms=403.74 sm_util=83.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=790 loss=240.1355 pred=237.1174 aux=150.9077 lr=7.90e-05 toks/s=224,075 tflops=396.72 mfu=40.11% step_ms=400.58 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=800 loss=144.9815 pred=141.9607 aux=151.0384 lr=8.00e-05 toks/s=222,245 tflops=393.48 mfu=39.79% step_ms=403.92 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=810 loss=81.1798 pred=78.0268 aux=157.6492 lr=8.10e-05 toks/s=227,005 tflops=401.90 mfu=40.64% step_ms=395.14 sm_util=98.0% hbm_util=70.0% mem_ctrl_util=70.0%
+step=820 loss=119.4452 pred=116.3787 aux=153.3213 lr=8.20e-05 toks/s=222,243 tflops=393.47 mfu=39.78% step_ms=403.84 sm_util=98.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=830 loss=294.1397 pred=291.0806 aux=152.9559 lr=8.30e-05 toks/s=225,118 tflops=398.56 mfu=40.30% step_ms=398.42 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=840 loss=118.8749 pred=115.8671 aux=150.3893 lr=8.40e-05 toks/s=222,172 tflops=393.35 mfu=39.77% step_ms=403.89 sm_util=91.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=850 loss=117.2587 pred=113.9907 aux=163.3988 lr=8.50e-05 toks/s=225,584 tflops=399.39 mfu=40.38% step_ms=397.64 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=860 loss=60.0585 pred=56.7303 aux=166.4096 lr=8.60e-05 toks/s=221,579 tflops=392.30 mfu=39.67% step_ms=405.08 sm_util=84.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=870 loss=367.5660 pred=364.5413 aux=151.2365 lr=8.70e-05 toks/s=219,131 tflops=387.96 mfu=39.23% step_ms=409.50 sm_util=93.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=880 loss=83.1368 pred=79.9024 aux=161.7207 lr=8.80e-05 toks/s=222,613 tflops=394.13 mfu=39.85% step_ms=403.00 sm_util=81.0% hbm_util=55.0% mem_ctrl_util=55.0%
+step=890 loss=113.2785 pred=110.1918 aux=154.3357 lr=8.90e-05 toks/s=221,252 tflops=391.72 mfu=39.61% step_ms=405.61 sm_util=85.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=900 loss=133.2361 pred=130.1100 aux=156.3067 lr=9.00e-05 toks/s=224,023 tflops=396.62 mfu=40.10% step_ms=400.52 sm_util=84.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=910 loss=232.7803 pred=229.7670 aux=150.6620 lr=9.10e-05 toks/s=219,641 tflops=388.87 mfu=39.32% step_ms=408.63 sm_util=98.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=920 loss=308.2750 pred=305.0703 aux=160.2303 lr=9.20e-05 toks/s=225,604 tflops=399.42 mfu=40.39% step_ms=397.61 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=930 loss=121.0736 pred=117.8411 aux=161.6253 lr=9.30e-05 toks/s=224,875 tflops=398.13 mfu=40.26% step_ms=398.89 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=940 loss=123.7397 pred=120.3638 aux=168.7956 lr=9.40e-05 toks/s=226,621 tflops=401.22 mfu=40.57% step_ms=395.86 sm_util=98.0% hbm_util=70.0% mem_ctrl_util=70.0%
+step=950 loss=167.4992 pred=164.2918 aux=160.3717 lr=9.50e-05 toks/s=225,799 tflops=399.77 mfu=40.42% step_ms=397.43 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=960 loss=340.0943 pred=336.9182 aux=158.8030 lr=9.60e-05 toks/s=227,903 tflops=403.49 mfu=40.80% step_ms=393.74 sm_util=83.0% hbm_util=56.0% mem_ctrl_util=56.0%
+step=970 loss=190.1913 pred=187.0256 aux=158.2856 lr=9.70e-05 toks/s=228,955 tflops=405.36 mfu=40.99% step_ms=391.96 sm_util=91.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=980 loss=274.3357 pred=270.9675 aux=168.4099 lr=9.80e-05 toks/s=222,190 tflops=393.38 mfu=39.78% step_ms=403.79 sm_util=83.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=990 loss=379.5789 pred=376.3757 aux=160.1630 lr=9.90e-05 toks/s=225,478 tflops=399.20 mfu=40.36% step_ms=398.03 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=1000 loss=419.0906 pred=415.8816 aux=160.4488 lr=1.00e-04 toks/s=223,751 tflops=396.14 mfu=40.05% step_ms=400.97 sm_util=82.0% hbm_util=54.0% mem_ctrl_util=54.0%
+val step=1000 pred=309.1890 aux=139.5640 mae=116.8252 mse=79388.4614
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.30
+```
+
+So results aren't good, but we can train, it does something! I will revisit to train (TBH, probably there are a lot of model performance tricks I'm sure to improve performance).

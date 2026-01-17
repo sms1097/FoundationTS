@@ -20,7 +20,8 @@ except Exception:
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    # Use the padded sequence length as an upper bound to avoid scalar extraction.
+    max_seqlen_in_batch = attention_mask.shape[1]
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         indices,
@@ -34,7 +35,6 @@ def _get_segment_unpad_data(attention_mask: torch.Tensor, segment_ids: torch.Ten
     device = attention_mask.device
     indices_list = []
     cu_seqlens = [0]
-    max_seqlen = 0
     for b in range(batch_size):
         mask = attention_mask[b].to(torch.bool)
         if not mask.any():
@@ -49,7 +49,6 @@ def _get_segment_unpad_data(attention_mask: torch.Tensor, segment_ids: torch.Ten
         starts = torch.nonzero(change, as_tuple=False).flatten()
         ends = torch.cat([starts[1:], torch.tensor([seg.numel()], device=device)])
         lengths = ends - starts
-        max_seqlen = max(max_seqlen, int(lengths.max().item()))
         for length in lengths.tolist():
             cu_seqlens.append(cu_seqlens[-1] + int(length))
         indices_list.append(valid_pos + b * seq_len)
@@ -58,7 +57,8 @@ def _get_segment_unpad_data(attention_mask: torch.Tensor, segment_ids: torch.Ten
     else:
         indices = torch.cat(indices_list)
     cu_seqlens = torch.tensor(cu_seqlens, device=device, dtype=torch.int32)
-    return indices, cu_seqlens, max_seqlen
+    # Use the padded sequence length as an upper bound to avoid scalar extraction.
+    return indices, cu_seqlens, seq_len
 
 
 class RMSNorm(nn.Module):
@@ -395,7 +395,8 @@ class EfficientMOELayer(nn.Module):
         hidden_size: int,
         num_experts: int,
         k: int,
-        max_batch_tokens: int,   # <-- REQUIRED for fixed capacity
+        max_batch_tokens: int,  # <-- REQUIRED for fixed capacity
+        moe_m_tile: int = 1,
         d_ff: int | None = None,
         d_expert: int | None = None,
         capacity_factor: float = 1.3,  # typical 1.1-1.3; tune
@@ -404,10 +405,13 @@ class EfficientMOELayer(nn.Module):
         super().__init__()
         assert k >= 1
         assert drop_policy in ("drop", "zero")
+        if moe_m_tile < 1:
+            raise ValueError("moe_m_tile must be >= 1.")
 
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.k = k
+        self.moe_m_tile = int(moe_m_tile)
         self.capacity_factor = float(capacity_factor)
         self.drop_policy = drop_policy
 
@@ -468,8 +472,13 @@ class EfficientMOELayer(nn.Module):
         r = torch.arange(expert_sorted.numel(), device=hidden_state.device)
         positions = r - starts[expert_sorted]
 
-        # Enforce fixed capacity and drop masked routes
-        in_cap = positions < C  # [R] bool
+        # Enforce fixed capacity and round down to the nearest multiple of moe_m_tile.
+        cap_counts = torch.minimum(counts, counts.new_full(counts.shape, C))
+        if self.moe_m_tile > 1:
+            keep_limit = cap_counts - (cap_counts % self.moe_m_tile)
+        else:
+            keep_limit = cap_counts
+        in_cap = positions < keep_limit[expert_sorted]  # [R] bool
         nonzero = gate_sorted != 0
         keep = in_cap & nonzero
 
@@ -477,11 +486,12 @@ class EfficientMOELayer(nn.Module):
         e_idx = expert_sorted
         p_idx = positions.clamp(min=0, max=C - 1)
         lin = e_idx * C + p_idx  # linear slot in [E*C]
-        src = x_sorted * keep.to(x_sorted.dtype).unsqueeze(-1)
+
+        lin_valid = lin[keep]
+        src_valid = x_sorted[keep]
+
         expert_inputs_flat = x_sorted.new_zeros((E * C, D))
-        expert_inputs_flat = torch.scatter(
-            expert_inputs_flat, 0, lin.unsqueeze(-1).expand(-1, D), src
-        )
+        expert_inputs_flat.scatter_(0, lin_valid[:, None].expand(-1, D), src_valid)
         expert_inputs = expert_inputs_flat.view(E, C, D)
 
         # Run experts and gather outputs back per route.
@@ -517,7 +527,12 @@ class EfficientMOELayer(nn.Module):
 
         # Compute load/importance stats with masking-aware routing.
         if attention_mask is None:
-            load_counts = torch.bincount(expert_for_route, minlength=E)
+            kept_experts = expert_sorted[keep]
+            load_counts = (
+                torch.bincount(kept_experts, minlength=E)
+                if kept_experts.numel()
+                else torch.zeros(E, device=router_scores.device, dtype=torch.long)
+            )
             load = load_counts / (load_counts.sum() + 1e-12)
             importance = router_scores.mean(dim=(0, 1))
         else:
@@ -525,10 +540,10 @@ class EfficientMOELayer(nn.Module):
             denom = flat_mask.sum() + 1e-12
             importance = (router_scores * flat_mask.view(B, T, 1)).sum(dim=(0, 1)) / denom
 
-            valid_routes = gate_for_route != 0
+            kept_experts = expert_sorted[keep]
             load_counts = (
-                torch.bincount(expert_for_route[valid_routes], minlength=E)
-                if valid_routes.any()
+                torch.bincount(kept_experts, minlength=E)
+                if kept_experts.numel()
                 else torch.zeros(E, device=router_scores.device, dtype=torch.long)
             )
             load = load_counts / (load_counts.sum() + 1e-12)

@@ -1,13 +1,13 @@
 import math
-import time
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
 import pynvml
 import torch
-from torch.utils.data import DataLoader, random_split, Sampler, Subset
+from torch.utils.data import DataLoader, Sampler, Subset, random_split
 
 from foundation_ts.dataset import build_ts_dataset
 from foundation_ts.models.training.config import RunnerConfig
@@ -176,7 +176,9 @@ def _build_model(model_config, device: torch.device, max_batch_tokens: int) -> T
         horizons=model_config.horizons,
         d_ff=model_config.d_ff,
         d_expert=model_config.d_expert,
+        moe_m_tile=model_config.moe_m_tile,
         max_batch_tokens=max_batch_tokens,
+        capacity_factor=model_config.capacity_factor,
         moe_impl=model_config.moe_impl,
     )
     model.to(device)
@@ -267,11 +269,7 @@ def _build_profiler(train_config, device: torch.device, checkpoint_dir: Path):
     profile_warmup = 10
     profile_active = 1
     profile_repeat = 1
-    profile_dir = (
-        Path(train_config.profile_dir)
-        if train_config.profile_dir
-        else checkpoint_dir / "profiler"
-    )
+    profile_dir = Path(train_config.profile_dir) if train_config.profile_dir else checkpoint_dir / "profiler"
     profile_dir.mkdir(parents=True, exist_ok=True)
     activities = [torch.profiler.ProfilerActivity.CPU]
     if device.type == "cuda":
@@ -430,15 +428,73 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
             expert_params += layer_expert_params
             if module.num_experts:
                 active_expert_params += layer_expert_params * (module.k / module.num_experts)
-        elif hasattr(module, "expert_layers"):
-            layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
-            expert_params += layer_expert_params
-            num_experts = getattr(module, "num_experts", 0)
-            k = getattr(module, "k", 0)
-            if num_experts:
-                active_expert_params += layer_expert_params * (k / num_experts)
     active_params = int(round(total_params - expert_params + active_expert_params))
     return total_params, active_params
+
+
+def estimate_transformer_moe_executed_flops(
+    model: TSMOE,
+    batch_size: int,
+    seq_len: int,
+    include_backward: bool = True,
+) -> float:
+    """
+    Estimate FLOPs executed by TSMOE for a single batch.
+
+    Notes:
+    - Counts dense matmuls for projections/FFNs and attention score/value matmuls.
+    - Uses a uniform routing assumption for expert token counts and applies capacity
+      + moe_m_tile rounding (per expert) to estimate executed MoE tokens.
+    - Ignores softmax, layernorm, elementwise ops, and routing overhead.
+    """
+    if batch_size <= 0 or seq_len <= 0:
+        return 0.0
+
+    n_tokens = batch_size * seq_len
+    hidden_size = model.embed_layer.hidden_size
+    input_size = model.embed_layer.input_size
+
+    # Embedding: two linear projections (gate + value).
+    flops = 4.0 * n_tokens * input_size * hidden_size
+
+    # Output heads.
+    for head in model.output_layer.heads.values():
+        out_features = head.weight.shape[0]
+        flops += 2.0 * n_tokens * hidden_size * out_features
+
+    for layer in model.decoder_layers:
+        # Attention projections: Q, K, V, and output.
+        flops += 8.0 * n_tokens * hidden_size * hidden_size
+        # Attention score/value matmuls.
+        flops += 4.0 * batch_size * seq_len * seq_len * hidden_size
+
+        for expert_layer in layer.expert_layers:
+            if not isinstance(expert_layer, EfficientMOELayer):
+                continue
+            num_experts = expert_layer.num_experts
+            k = expert_layer.k
+            capacity = expert_layer.capacity
+            m_tile = max(1, expert_layer.moe_m_tile)
+
+            # Router projections.
+            flops += 2.0 * n_tokens * hidden_size * num_experts
+            flops += 2.0 * n_tokens * hidden_size  # shared gate
+
+            # Shared expert FFN (dense for all tokens).
+            d_ff = expert_layer.shared_expert.gate_proj.weight.shape[0]
+            flops += 6.0 * n_tokens * hidden_size * d_ff
+
+            # Expert FFN (sparse with rounding).
+            d_expert = expert_layer.experts.w_gate.shape[2]
+            avg_routes_per_expert = (n_tokens * k) / max(1, num_experts)
+            kept_per_expert = min(capacity, int(avg_routes_per_expert))
+            kept_per_expert -= kept_per_expert % m_tile
+            total_expert_tokens = num_experts * capacity
+            flops += 6.0 * total_expert_tokens * hidden_size * d_expert
+
+    if include_backward:
+        flops *= 3.0
+    return flops
 
 
 def _infer_max_batch_tokens(config: RunnerConfig) -> int:
@@ -595,17 +651,16 @@ def train(config: RunnerConfig) -> TSMOE:
     data_loader, val_loader, ood_val_loader = _build_dataloaders(config)
     max_batch_tokens = _infer_max_batch_tokens(config)
     model = _build_model(model_config, device, max_batch_tokens)
-    model = _maybe_compile_model(model, train_config)
-    optimizer, scheduler = _build_optimizer_scheduler(model, train_config, device)
-    start_step = _maybe_resume_from_checkpoint(model, optimizer, scheduler, train_config, device)
-
-    total_steps = train_config.epochs * train_config.steps_per_epoch
-
     total_params, active_params = _estimate_active_params(model)
-    flops_per_token = _estimate_flops_per_token(active_params)
-    peak_flops = (
-        train_config.mfu_peak_tflops * 1e12 if train_config.mfu_peak_tflops else None
+    seq_len = max(1, max_batch_tokens // max(1, train_config.batch_size))
+    flops_per_batch = estimate_transformer_moe_executed_flops(
+        model,
+        batch_size=train_config.batch_size,
+        seq_len=seq_len,
+        include_backward=True,
     )
+    flops_per_token = flops_per_batch / max(1, max_batch_tokens)
+    peak_flops = train_config.mfu_peak_tflops * 1e12 if train_config.mfu_peak_tflops else None
     print(
         "params "
         f"total={_format_param_count(total_params)} ({total_params:,}) "
@@ -617,6 +672,12 @@ def train(config: RunnerConfig) -> TSMOE:
         gpu_name = "cpu"
     precision = _format_precision(train_config, device)
     print(f"device model={gpu_name} precision={precision}")
+
+    model = _maybe_compile_model(model, train_config)
+    optimizer, scheduler = _build_optimizer_scheduler(model, train_config, device)
+    start_step = _maybe_resume_from_checkpoint(model, optimizer, scheduler, train_config, device)
+
+    total_steps = train_config.epochs * train_config.steps_per_epoch
 
     model.train()
     checkpoint_dir = Path(train_config.checkpoint_dir)
@@ -786,7 +847,6 @@ def train(config: RunnerConfig) -> TSMOE:
 
             if train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
                 _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
-
 
     if train_config.log_perf_metrics:
         if device.type == "cuda":
