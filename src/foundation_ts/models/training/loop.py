@@ -1,12 +1,13 @@
 import math
 import time
+import random
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
 import pynvml
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Sampler, Subset
 
 from foundation_ts.dataset import build_ts_dataset
 from foundation_ts.models.training.config import RunnerConfig
@@ -29,17 +30,108 @@ def _get_device(device: str | None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+class BucketBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        bucket_indices: dict[int, list[int]],
+        batch_size: int,
+        drop_last: bool,
+        shuffle: bool,
+        seed: int | None = None,
+    ) -> None:
+        self.bucket_indices = bucket_indices
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        batches: list[list[int]] = []
+        for indices in self.bucket_indices.values():
+            indices = list(indices)
+            if self.shuffle:
+                rng.shuffle(indices)
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i : i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        for batch in batches:
+            yield batch
+
+    def __len__(self) -> int:
+        total = 0
+        for indices in self.bucket_indices.values():
+            if self.drop_last:
+                total += len(indices) // self.batch_size
+            else:
+                total += (len(indices) + self.batch_size - 1) // self.batch_size
+        return total
+
+
 def _build_dataloaders(
     config: RunnerConfig,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
     ds_config = config.dataset_config
     train_config = config.train_config
+    if ds_config.pack_buckets and not ds_config.pack_sequences:
+        raise ValueError("pack_buckets requires pack_sequences.")
+    if ds_config.pack_sequences and train_config.model_config.patch:
+        raise ValueError("pack_sequences is not supported with patching enabled.")
     ds = build_ts_dataset(
         ds_config.dataset_path,
         max_length=ds_config.seq_max_len,
         stride=ds_config.seq_stride,
         normalization_method=ds_config.normalization_func,
+        pack_sequences=ds_config.pack_sequences,
+        pack_buckets=ds_config.pack_buckets,
     )
+
+    def _make_loader(dataset, shuffle: bool, drop_last: bool) -> DataLoader:
+        if ds_config.pack_sequences and ds_config.pack_buckets:
+            if hasattr(dataset, "pack_bucket_indices"):
+                bucket_indices = dataset.pack_bucket_indices
+            elif isinstance(dataset, Subset) and hasattr(dataset.dataset, "pack_plan"):
+                bucket_indices = {}
+                for local_idx, global_idx in enumerate(dataset.indices):
+                    size = dataset.dataset.pack_plan[global_idx][0]
+                    bucket_indices.setdefault(size, []).append(local_idx)
+            else:
+                raise ValueError("pack_buckets requested but dataset does not expose bucket indices.")
+            if not bucket_indices:
+                raise ValueError("pack_buckets requested but no bucket indices were built.")
+            batch_sampler = BucketBatchSampler(
+                bucket_indices=bucket_indices,
+                batch_size=train_config.batch_size,
+                drop_last=drop_last,
+                shuffle=shuffle,
+                seed=train_config.seed,
+            )
+            dl_kwargs = dict(
+                batch_sampler=batch_sampler,
+                num_workers=train_config.num_workers,
+                pin_memory=train_config.pin_memory,
+            )
+            if train_config.num_workers > 0:
+                dl_kwargs["prefetch_factor"] = train_config.prefetch_factor
+            return DataLoader(
+                dataset,
+                **dl_kwargs,
+            )
+
+        dl_kwargs = dict(
+            batch_size=train_config.batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            num_workers=train_config.num_workers,
+            pin_memory=train_config.pin_memory,
+        )
+        if train_config.num_workers > 0:
+            dl_kwargs["prefetch_factor"] = train_config.prefetch_factor
+        return DataLoader(dataset, **dl_kwargs)
 
     if train_config.val_split > 0:
         val_size = max(1, int(len(ds) * train_config.val_split))
@@ -48,29 +140,11 @@ def _build_dataloaders(
     else:
         train_ds, val_ds = ds, None
 
-    dl_kwargs = dict(
-        batch_size=train_config.batch_size,
-        shuffle=True,
-        drop_last=train_config.drop_last,
-        num_workers=train_config.num_workers,
-        pin_memory=train_config.pin_memory,
-    )
-    if train_config.num_workers > 0:
-        dl_kwargs["prefetch_factor"] = train_config.prefetch_factor
-    data_loader = DataLoader(train_ds, **dl_kwargs)
+    data_loader = _make_loader(train_ds, shuffle=True, drop_last=train_config.drop_last)
 
     val_loader = None
     if val_ds is not None:
-        val_kwargs = dict(
-            batch_size=train_config.batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=train_config.num_workers,
-            pin_memory=train_config.pin_memory,
-        )
-        if train_config.num_workers > 0:
-            val_kwargs["prefetch_factor"] = train_config.prefetch_factor
-        val_loader = DataLoader(val_ds, **val_kwargs)
+        val_loader = _make_loader(val_ds, shuffle=False, drop_last=False)
 
     ood_val_loader = None
     if train_config.ood_val_dataset_path:
@@ -79,17 +153,10 @@ def _build_dataloaders(
             max_length=ds_config.seq_max_len,
             stride=ds_config.seq_stride,
             normalization_method=ds_config.normalization_func,
+            pack_sequences=ds_config.pack_sequences,
+            pack_buckets=ds_config.pack_buckets,
         )
-        ood_kwargs = dict(
-            batch_size=train_config.batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=train_config.num_workers,
-            pin_memory=train_config.pin_memory,
-        )
-        if train_config.num_workers > 0:
-            ood_kwargs["prefetch_factor"] = train_config.prefetch_factor
-        ood_val_loader = DataLoader(ood_ds, **ood_kwargs)
+        ood_val_loader = _make_loader(ood_ds, shuffle=False, drop_last=False)
 
     return data_loader, val_loader, ood_val_loader
 
@@ -98,6 +165,7 @@ def _build_model(model_config, device: torch.device, max_batch_tokens: int) -> T
     model = TSMOE(
         hidden_size=model_config.hidden_size,
         n_decoder_layers=model_config.n_decoder_layers,
+        input_size=model_config.input_size,
         patch=model_config.patch,
         patch_len=model_config.patch_len,
         patch_stride=model_config.patch_stride,
@@ -109,6 +177,7 @@ def _build_model(model_config, device: torch.device, max_batch_tokens: int) -> T
         d_ff=model_config.d_ff,
         d_expert=model_config.d_expert,
         max_batch_tokens=max_batch_tokens,
+        moe_impl=model_config.moe_impl,
     )
     model.to(device)
     return model
@@ -272,7 +341,7 @@ def _run_validation(
     total_count = torch.zeros((), device=device)
     count = 0
     for batch in val_loader:
-        input_ids, labels, loss_masks = _prepare_batch(batch, device)
+        input_ids, labels, loss_masks, segment_ids = _prepare_batch(batch, device)
         attention_mask = _build_attention_mask(loss_masks, patch, patch_len, patch_stride)
         if use_amp and use_bf16 and device.type == "cuda":
             autocast_dtype = torch.bfloat16
@@ -280,7 +349,7 @@ def _run_validation(
             autocast_dtype = None
 
         if autocast_dtype is None:
-            outputs, stats = model(input_ids, attention_mask=attention_mask)
+            outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
             pred_loss = _forecast_loss(
                 outputs,
                 labels,
@@ -292,7 +361,7 @@ def _run_validation(
             )
         else:
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                outputs, stats = model(input_ids, attention_mask=attention_mask)
+                outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
                 pred_loss = _forecast_loss(
                     outputs,
                     labels,
@@ -309,6 +378,12 @@ def _run_validation(
             labels, loss_masks = _patch_labels_and_masks(labels, loss_masks, patch_len, patch_stride)
         for horizon, preds in outputs.items():
             targets, masks = _build_horizon_targets(labels, loss_masks, horizon)
+            input_size = preds.size(-1) // horizon
+            preds = preds.view(preds.size(0), preds.size(1), horizon, input_size)
+            if targets.size(-1) == 1 and input_size > 1:
+                targets = targets.expand(-1, -1, -1, input_size)
+            if masks.size(-1) == 1 and input_size > 1:
+                masks = masks.expand(-1, -1, -1, input_size)
             diff = (preds - targets) * masks
             total_mae += diff.abs().sum()
             total_mse += (diff**2).sum()
@@ -355,6 +430,13 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
             expert_params += layer_expert_params
             if module.num_experts:
                 active_expert_params += layer_expert_params * (module.k / module.num_experts)
+        elif hasattr(module, "expert_layers"):
+            layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
+            expert_params += layer_expert_params
+            num_experts = getattr(module, "num_experts", 0)
+            k = getattr(module, "k", 0)
+            if num_experts:
+                active_expert_params += layer_expert_params * (k / num_experts)
     active_params = int(round(total_params - expert_params + active_expert_params))
     return total_params, active_params
 
@@ -452,7 +534,7 @@ def _train_microbatches(
             data_iter = iter(data_loader)
             batch = next(data_iter)
 
-        input_ids, labels, loss_masks = _prepare_batch(batch, device)
+        input_ids, labels, loss_masks, segment_ids = _prepare_batch(batch, device)
         attention_mask = _build_attention_mask(
             loss_masks,
             model_config.patch,
@@ -461,7 +543,7 @@ def _train_microbatches(
         )
 
         if autocast_dtype is None:
-            outputs, stats = model(input_ids, attention_mask=attention_mask)
+            outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
             pred_loss = _forecast_loss(
                 outputs,
                 labels,
@@ -473,7 +555,7 @@ def _train_microbatches(
             )
         else:
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                outputs, stats = model(input_ids, attention_mask=attention_mask)
+                outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
                 pred_loss = _forecast_loss(
                     outputs,
                     labels,

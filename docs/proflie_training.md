@@ -1,7 +1,5 @@
 ## Training profiler setup
 
-This project supports PyTorch profiling with a Chrome trace file. Enable it with
-`--profile`, and adjust the schedule if needed.
 
 ### Example
 
@@ -704,6 +702,7 @@ Small error with 3 options:
 2. Keep the real max and allow scalar capture (set torch._dynamo.config.capture_scalar_outputs = True or env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1), or
 3. Compute the max outside the compiled region and pass it in (e.g., precompute from the mask in the caller and add an optional max_seqlen arg).
 
+Trace is `profile_traces/`.
 
 Option #1:
 ```
@@ -760,9 +759,9 @@ foundationts train \
   --log-perf-metrics \
   --mfu-peak-tflops 1979 \
   --compile
-
 ```
 
+Trace file is `big_mfu_gain.json`.
 
 So just increased to 22, that's a good size increase!
 ```
@@ -780,5 +779,319 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=77.00
 ```
 
 
-#### TODO
+
+## Next Day
+I'm making some changes to more closely match the implementation from Time-MOE. Here's what I changed:
+
+- Attention has separate q,k,v projections instead of one qkv proj
+- Added gate_proj
+
+Attention: split qkv_proj into q_proj, k_proj, v_proj, keep o_proj in layers.py.
+MoE experts: switched to gate_proj/up_proj/down_proj (SiLU), and set defaults to d_ff = 4 * hidden_size, d_expert = d_ff // k in layers.py.
+Output heads: now emit horizon * input_size per head in model.py.
+Embedding: input size now honors input_size (and patch_len * input_size when patched) in model.py.
+Model config: added input_size to CLI/config and pass-through in config.py, cli.py, loop.py.
+
+New Command:
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 16 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --compile
+```
+
+
+
+```
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5663.3120 pred=5660.3594 aux=147.6366 lr=1.00e-06 toks/s=28,407 tflops=67.63 mfu=3.42% step_ms=2142.02 sm_util=98.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=20 loss=5714.3550 pred=5711.3770 aux=148.8905 lr=2.00e-06 toks/s=199,885 tflops=475.87 mfu=24.05% step_ms=326.08 sm_util=80.0% hbm_util=50.0% mem_ctrl_util=50.0%
+step=160 loss=4943.9971 pred=4941.0352 aux=148.1076 lr=1.60e-05 toks/s=200,004 tflops=476.15 mfu=24.06% step_ms=325.82 sm_util=78.0% hbm_util=49.0% mem_ctrl_util=49.0%
+step=170 loss=5163.7744 pred=5160.7422 aux=151.6148 lr=1.70e-05 toks/s=205,548 tflops=489.35 mfu=24.73% step_ms=317.03 sm_util=79.0% hbm_util=50.0% mem_ctrl_util=50.0%
+step=180 loss=4658.3608 pred=4655.3652 aux=149.7702 lr=1.80e-05 toks/s=203,467 tflops=484.39 mfu=24.48% step_ms=320.30 sm_util=96.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=190 loss=4599.5347 pred=4596.5684 aux=148.3087 lr=1.90e-05 toks/s=198,050 tflops=471.50 mfu=23.83% step_ms=329.36 sm_util=80.0% hbm_util=51.0% mem_ctrl_util=51.0%
+step=200 loss=4441.9048 pred=4438.9614 aux=147.1740 lr=2.00e-05 toks/s=203,376 tflops=484.18 mfu=24.47% step_ms=320.38 sm_util=81.0% hbm_util=53.0% mem_ctrl_util=53.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=56.28
+```
+I'll increase batch size a bit on the next run to up the sm_util since we aren't saturating RAM. There is a small drop in MFU, but it's pretty close.
+
+### Sequence Packing
+You can add `--pack-sequences` now to run the code!
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 22 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --pack-sequences \
+  --compile 
+```
+
+```
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5894.1631 pred=5891.1680 aux=149.7560 lr=1.00e-06 toks/s=38,768 tflops=92.30 mfu=4.66% step_ms=1948.81 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=20 loss=5763.2783 pred=5760.2578 aux=151.0268 lr=2.00e-06 toks/s=170,092 tflops=404.94 mfu=20.46% step_ms=479.55 sm_util=86.0% hbm_util=55.0% mem_ctrl_util=55.0%
+step=30 loss=5848.5884 pred=5845.5850 aux=150.1603 lr=3.00e-06 toks/s=170,122 tflops=405.01 mfu=20.47% step_ms=479.56 sm_util=98.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=40 loss=5759.3818 pred=5756.3828 aux=149.9534 lr=4.00e-06 toks/s=171,299 tflops=407.81 mfu=20.61% step_ms=476.01 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=50 loss=5841.9927 pred=5838.9912 aux=150.0702 lr=5.00e-06 toks/s=171,629 tflops=408.60 mfu=20.65% step_ms=475.18 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=60 loss=5788.2378 pred=5785.2373 aux=150.0143 lr=6.00e-06 toks/s=170,855 tflops=406.75 mfu=20.55% step_ms=477.29 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=70 loss=5859.9165 pred=5856.9536 aux=148.1409 lr=7.00e-06 toks/s=172,482 tflops=410.63 mfu=20.75% step_ms=472.83 sm_util=83.0% hbm_util=50.0% mem_ctrl_util=50.0%
+step=80 loss=5739.6338 pred=5736.6592 aux=148.7252 lr=8.00e-06 toks/s=169,209 tflops=402.84 mfu=20.36% step_ms=481.92 sm_util=69.0% hbm_util=39.0% mem_ctrl_util=39.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=68.62
+```
+
+Sequence packing degrades the code! I'm going to get a clean baseline without compile then with --pack sequences
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 18 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --profile
+```
+
+
+Trace is `no_compile_no_pack.json`.
+```
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5725.8984 pred=5722.9912 aux=145.3512 lr=1.00e-06 toks/s=100,542 tflops=239.36 mfu=12.10% step_ms=582.54 sm_util=99.0% hbm_util=69.0% mem_ctrl_util=69.0%
+step=20 loss=5739.0415 pred=5736.1396 aux=145.0949 lr=2.00e-06 toks/s=165,823 tflops=394.77 mfu=19.95% step_ms=444.01 sm_util=99.0% hbm_util=69.0% mem_ctrl_util=69.0%
+step=30 loss=5837.7710 pred=5834.8638 aux=145.3615 lr=3.00e-06 toks/s=144,374 tflops=343.71 mfu=17.37% step_ms=433.97 sm_util=99.0% hbm_util=72.0% mem_ctrl_util=72.0% kernels/step=612.1
+step=40 loss=5752.9233 pred=5750.0132 aux=145.4969 lr=4.00e-06 toks/s=78,606 tflops=187.14 mfu=9.46% step_ms=437.07 sm_util=92.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=50 loss=5844.4873 pred=5841.5825 aux=145.2343 lr=5.00e-06 toks/s=167,670 tflops=399.17 mfu=20.17% step_ms=431.05 sm_util=93.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=60 loss=5661.1875 pred=5658.2886 aux=144.9550 lr=6.00e-06 toks/s=165,818 tflops=394.76 mfu=19.95% step_ms=435.93 sm_util=95.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=70 loss=5785.2524 pred=5782.3506 aux=145.0862 lr=7.00e-06 toks/s=164,636 tflops=391.95 mfu=19.81% step_ms=438.97 sm_util=99.0% hbm_util=68.0% mem_ctrl_util=68.0%
+step=80 loss=5487.4180 pred=5484.5117 aux=145.3167 lr=8.00e-06 toks/s=168,304 tflops=400.68 mfu=20.25% step_ms=429.24 sm_util=99.0% hbm_util=68.0% mem_ctrl_util=68.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=73.73 kernels/step=612.1
+```
+
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 18 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --profile \
+  --compile
+
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5720.7017 pred=5717.7227 aux=148.9576 lr=1.00e-06 toks/s=51,636 tflops=122.93 mfu=6.21% step_ms=1258.28 sm_util=99.0% hbm_util=69.0% mem_ctrl_util=69.0%
+step=20 loss=5754.1670 pred=5751.2090 aux=147.9119 lr=2.00e-06 toks/s=209,228 tflops=498.11 mfu=25.17% step_ms=351.80 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+step=30 loss=5825.7754 pred=5822.7930 aux=149.1110 lr=3.00e-06 toks/s=169,377 tflops=403.24 mfu=20.38% step_ms=346.13 sm_util=84.0% hbm_util=54.0% mem_ctrl_util=54.0% kernels/step=543.9
+step=40 loss=5713.5190 pred=5710.5366 aux=149.1148 lr=4.00e-06 toks/s=114,117 tflops=271.68 mfu=13.73% step_ms=346.65 sm_util=89.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=50 loss=5898.8755 pred=5895.8574 aux=150.8925 lr=5.00e-06 toks/s=212,689 tflops=506.35 mfu=25.59% step_ms=340.54 sm_util=91.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=60 loss=5615.9878 pred=5612.9922 aux=149.7820 lr=6.00e-06 toks/s=209,613 tflops=499.03 mfu=25.22% step_ms=345.64 sm_util=87.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=70 loss=5751.0024 pred=5748.0010 aux=150.0754 lr=7.00e-06 toks/s=207,769 tflops=494.64 mfu=24.99% step_ms=348.77 sm_util=84.0% hbm_util=53.0% mem_ctrl_util=53.0%
+step=80 loss=5528.2930 pred=5525.2812 aux=150.5949 lr=8.00e-06 toks/s=213,671 tflops=508.69 mfu=25.70% step_ms=338.92 sm_util=85.0% hbm_util=58.0% mem_ctrl_util=58.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=61.35 kernels/step=543.9
+```
+
+
+
+with pack sequences, no compile
+```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 18   --seq-max-len 4096   --seq-stride 4096   --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --profile --pack-sequences
+
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5927.4429 pred=5924.5342 aux=145.4337 lr=1.00e-06 toks/s=98,671 tflops=234.91 mfu=11.87% step_ms=594.84 sm_util=99.0% hbm_util=67.0% mem_ctrl_util=67.0%
+step=20 loss=5675.5239 pred=5672.6094 aux=145.7256 lr=2.00e-06 toks/s=139,690 tflops=332.56 mfu=16.80% step_ms=527.21 sm_util=85.0% hbm_util=52.0% mem_ctrl_util=52.0%
+step=30 loss=5782.7520 pred=5779.8389 aux=145.6443 lr=3.00e-06 toks/s=114,699 tflops=273.07 mfu=13.80% step_ms=514.57 sm_util=79.0% hbm_util=45.0% mem_ctrl_util=45.0% kernels/step=1075.4
+step=40 loss=5733.9673 pred=5731.0488 aux=145.9195 lr=4.00e-06 toks/s=96,998 tflops=230.92 mfu=11.67% step_ms=508.84 sm_util=75.0% hbm_util=42.0% mem_ctrl_util=42.0%
+step=50 loss=5844.2461 pred=5841.3276 aux=145.9183 lr=5.00e-06 toks/s=140,869 tflops=335.37 mfu=16.95% step_ms=508.92 sm_util=90.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=60 loss=5845.5728 pred=5842.6499 aux=146.1366 lr=6.00e-06 toks/s=140,403 tflops=334.26 mfu=16.89% step_ms=510.50 sm_util=99.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=70 loss=5818.6606 pred=5815.7349 aux=146.2972 lr=7.00e-06 toks/s=141,434 tflops=336.71 mfu=17.01% step_ms=506.66 sm_util=99.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=80 loss=5554.5957 pred=5551.6748 aux=146.0499 lr=8.00e-06 toks/s=141,443 tflops=336.73 mfu=17.02% step_ms=506.51 sm_util=99.0% hbm_util=66.0% mem_ctrl_util=66.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=73.87 kernels/step=1075.4
+```
+
+
+Sequence packign with compile
+
+```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 18   --seq-max-len 4096   --seq-stride 4096   --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --profile --pack-sequences --compile
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=5950.9756 pred=5947.9683 aux=150.3554 lr=1.00e-06 toks/s=72,723 tflops=173.13 mfu=8.75% step_ms=846.99 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=20 loss=5717.9722 pred=5714.9678 aux=150.2258 lr=2.00e-06 toks/s=168,104 tflops=400.21 mfu=20.22% step_ms=437.99 sm_util=98.0% hbm_util=61.0% mem_ctrl_util=61.0%
+step=30 loss=5782.1133 pred=5779.1030 aux=150.5211 lr=3.00e-06 toks/s=129,350 tflops=307.94 mfu=15.56% step_ms=428.51 sm_util=78.0% hbm_util=48.0% mem_ctrl_util=48.0% 
+step=40 loss=5719.5879 pred=5716.5508 aux=151.8540 lr=4.00e-06 toks/s=114,992 tflops=273.76 mfu=13.83% step_ms=419.81 sm_util=73.0% hbm_util=45.0% mem_ctrl_util=45.0%
+step=50 loss=5775.6450 pred=5772.6333 aux=150.5970 lr=5.00e-06 toks/s=170,538 tflops=406.00 mfu=20.52% step_ms=419.92 sm_util=98.0% hbm_util=64.0% mem_ctrl_util=64.0%
+step=60 loss=5902.6030 pred=5899.5693 aux=151.6927 lr=6.00e-06 toks/s=169,892 tflops=404.46 mfu=20.44% step_ms=421.72 sm_util=68.0% hbm_util=39.0% mem_ctrl_util=39.0%
+step=70 loss=5853.4351 pred=5850.4414 aux=149.6804 lr=7.00e-06 toks/s=171,462 tflops=408.20 mfu=20.63% step_ms=417.75 sm_util=89.0% hbm_util=54.0% mem_ctrl_util=54.0%
+step=80 loss=5595.5210 pred=5592.5396 aux=149.0769 lr=8.00e-06 toks/s=171,887 tflops=409.21 mfu=20.68% step_ms=416.65 sm_util=67.0% hbm_util=39.0% mem_ctrl_util=39.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=62.20 kernels/step=1008.6
+```
+
+So the thing is, torch comiple can't fuse as many kernels when we pack sequencs! 
+
+We will try bucketing now to see if that improve our implementation of sequence packing.
+
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 18 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --profile \
+  --pack-sequences \
+  --pack-buckets 4096
+
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=6173.3242 pred=6170.4287 aux=144.7831 lr=1.00e-06 toks/s=22,578 tflops=53.75 mfu=2.72% step_ms=516.45 sm_util=100.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=20 loss=6181.7554 pred=6178.8623 aux=144.6484 lr=2.00e-06 toks/s=114,984 tflops=273.74 mfu=13.83% step_ms=464.27 sm_util=99.0% hbm_util=62.0% mem_ctrl_util=62.0%
+step=30 loss=6217.8257 pred=6214.9321 aux=144.6818 lr=3.00e-06 toks/s=95,345 tflops=226.99 mfu=11.47% step_ms=469.85 sm_util=99.0% hbm_util=62.0% mem_ctrl_util=62.0% kernels/step=1077.8
+step=40 loss=6167.9971 pred=6165.1021 aux=144.7628 lr=4.00e-06 toks/s=64,740 tflops=154.13 mfu=7.79% step_ms=399.91 sm_util=99.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=50 loss=6172.7500 pred=6169.8550 aux=144.7564 lr=5.00e-06 toks/s=106,936 tflops=254.58 mfu=12.86% step_ms=415.90 sm_util=95.0% hbm_util=59.0% mem_ctrl_util=59.0%
+step=60 loss=6138.0781 pred=6135.1792 aux=144.9571 lr=6.00e-06 toks/s=102,717 tflops=244.54 mfu=12.36% step_ms=406.99 sm_util=77.0% hbm_util=48.0% mem_ctrl_util=48.0%
+step=70 loss=6081.5615 pred=6078.6626 aux=144.9447 lr=7.00e-06 toks/s=120,321 tflops=286.45 mfu=14.47% step_ms=467.64 sm_util=87.0% hbm_util=52.0% mem_ctrl_util=52.0%
+step=80 loss=6096.0366 pred=6093.1382 aux=144.9331 lr=8.00e-06 toks/s=105,446 tflops=251.04 mfu=12.68% step_ms=413.37 sm_util=57.0% hbm_util=29.0% mem_ctrl_util=29.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=75.89 kernels/step=1077.8
+```
+
+That's still really bad. Let's with only one pack bucket:
+
+```
+
+ foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 18 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --profile \
+  --pack-sequences \
+  --pack-buckets 4096
+params total=453.20M (453,196,137) active=198.39M (198,392,169)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=6126.1689 pred=6123.2637 aux=145.2522 lr=1.00e-06 toks/s=42,190 tflops=100.44 mfu=5.08% step_ms=579.56 sm_util=100.0% hbm_util=66.0% mem_ctrl_util=66.0%
+step=20 loss=6129.7563 pred=6126.8584 aux=144.8971 lr=2.00e-06 toks/s=135,367 tflops=322.27 mfu=16.28% step_ms=544.04 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
+step=30 loss=6127.3545 pred=6124.4492 aux=145.2623 lr=3.00e-06 toks/s=111,514 tflops=265.48 mfu=13.41% step_ms=531.55 sm_util=95.0% hbm_util=60.0% mem_ctrl_util=60.0% kernels/step=1077.8
+step=40 loss=6099.1943 pred=6096.2871 aux=145.3556 lr=4.00e-06 toks/s=94,550 tflops=225.10 mfu=11.37% step_ms=527.17 sm_util=98.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=50 loss=6089.9038 pred=6087.0034 aux=145.0211 lr=5.00e-06 toks/s=136,039 tflops=323.87 mfu=16.37% step_ms=527.30 sm_util=91.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=60 loss=6072.7310 pred=6069.8267 aux=145.2080 lr=6.00e-06 toks/s=135,612 tflops=322.85 mfu=16.31% step_ms=528.91 sm_util=83.0% hbm_util=51.0% mem_ctrl_util=51.0%
+step=70 loss=6031.2783 pred=6028.3716 aux=145.3383 lr=7.00e-06 toks/s=136,081 tflops=323.97 mfu=16.37% step_ms=527.00 sm_util=79.0% hbm_util=46.0% mem_ctrl_util=46.0%
+step=80 loss=5982.1304 pred=5979.2222 aux=145.4046 lr=8.00e-06 toks/s=135,901 tflops=323.54 mfu=16.35% step_ms=527.94 sm_util=77.0% hbm_util=44.0% mem_ctrl_util=44.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.29 kernels/step=1077.8
+```
+
+
+Okay so Sequence Packing isn't worth the extra engineering effort to try to figure out why all of these kernels are being launched. 
+
+
+## Trying Megablocks
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 18 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --hidden-size 768 \
+  --n-decoder-layers 12 \
+  --n-head 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 3072 \
+  --d-expert 1536 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 1979 \
+  --moe-impl megablocks \
+  --compile
+```
+
+
+## Other things to try
 - I need to figure out what other MOE frameworks do for this part of the network I'm trying to optimize

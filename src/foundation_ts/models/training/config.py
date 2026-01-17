@@ -8,12 +8,15 @@ class DatasetConfig:
     seq_max_len: int = 4096
     seq_stride: int = 4096
     normalization_func: Literal["max", "zero"] = "zero"
+    pack_sequences: bool = False
+    pack_buckets: list[int] | None = None
 
 
 @dataclass
 class ModelConfig:
     hidden_size: int
     n_decoder_layers: int
+    input_size: int = 1
     patch: bool = False
     patch_len: int = 32
     patch_stride: int = 32
@@ -24,6 +27,7 @@ class ModelConfig:
     d_ff: int | None = None
     d_expert: int | None = None
     horizons: list[int] = field(default_factory=lambda: [1, 8, 32, 64])
+    moe_impl: str = "efficient"
 
 
 @dataclass

@@ -29,6 +29,38 @@ def _get_unpad_data(attention_mask):
     )
 
 
+def _get_segment_unpad_data(attention_mask: torch.Tensor, segment_ids: torch.Tensor):
+    batch_size, seq_len = attention_mask.shape
+    device = attention_mask.device
+    indices_list = []
+    cu_seqlens = [0]
+    max_seqlen = 0
+    for b in range(batch_size):
+        mask = attention_mask[b].to(torch.bool)
+        if not mask.any():
+            continue
+        valid_pos = torch.nonzero(mask, as_tuple=False).flatten()
+        seg = segment_ids[b][valid_pos]
+        if seg.numel() == 0:
+            continue
+        change = torch.ones(seg.shape, device=device, dtype=torch.bool)
+        if seg.numel() > 1:
+            change[1:] = seg[1:] != seg[:-1]
+        starts = torch.nonzero(change, as_tuple=False).flatten()
+        ends = torch.cat([starts[1:], torch.tensor([seg.numel()], device=device)])
+        lengths = ends - starts
+        max_seqlen = max(max_seqlen, int(lengths.max().item()))
+        for length in lengths.tolist():
+            cu_seqlens.append(cu_seqlens[-1] + int(length))
+        indices_list.append(valid_pos + b * seq_len)
+    if not indices_list:
+        indices = torch.empty((0,), device=device, dtype=torch.long)
+    else:
+        indices = torch.cat(indices_list)
+    cu_seqlens = torch.tensor(cu_seqlens, device=device, dtype=torch.int32)
+    return indices, cu_seqlens, max_seqlen
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -118,23 +150,30 @@ class Attention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.rotary_emb = RotaryEmbedding(self.head_dim)
 
-        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
-    def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # hidden_state: (B, T, D)
         batch_size, seq_len, _ = hidden_state.shape
 
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=hidden_state.device, dtype=torch.int32)
 
-        qkv = self.qkv_proj(hidden_state)
-        qkv = qkv.contiguous().view(batch_size, seq_len, self.num_heads, 3 * self.head_dim)
-        qkv = qkv.swapaxes(1, 2)
+        q = self.q_proj(hidden_state)
+        k = self.k_proj(hidden_state)
+        v = self.v_proj(hidden_state)
 
-        q = qkv[..., : self.head_dim]
-        k = qkv[..., self.head_dim : 2 * self.head_dim]
-        v = qkv[..., 2 * self.head_dim :]
+        q = q.contiguous().view(batch_size, seq_len, self.num_heads, self.head_dim).swapaxes(1, 2)
+        k = k.contiguous().view(batch_size, seq_len, self.num_heads, self.head_dim).swapaxes(1, 2)
+        v = v.contiguous().view(batch_size, seq_len, self.num_heads, self.head_dim).swapaxes(1, 2)
 
         cos, sin = self.rotary_emb(q, seq_len=seq_len)
 
@@ -148,7 +187,10 @@ class Attention(nn.Module):
             .reshape(batch_size * seq_len, 3, self.num_heads, self.head_dim)
         )
 
-        indices, cu_seqlens, max_seqlen = _get_unpad_data(attention_mask)
+        if segment_ids is None:
+            indices, cu_seqlens, max_seqlen = _get_unpad_data(attention_mask)
+        else:
+            indices, cu_seqlens, max_seqlen = _get_segment_unpad_data(attention_mask, segment_ids)
 
         qkv = qkv.index_select(0, indices)
 
@@ -196,12 +238,13 @@ class Attention(nn.Module):
 class ExpertFFN(nn.Module):
     def __init__(self, d_model: int, d_hidden: int):
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_hidden, bias=False)
-        self.w2 = nn.Linear(d_hidden, d_model, bias=False)
-        self.act = nn.GELU()
+        self.gate_proj = nn.Linear(d_model, d_hidden, bias=False)
+        self.up_proj = nn.Linear(d_model, d_hidden, bias=False)
+        self.down_proj = nn.Linear(d_hidden, d_model, bias=False)
+        self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(self.act(self.w1(x)))
+        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Router(nn.Module):
@@ -210,13 +253,10 @@ class Router(nn.Module):
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.shared_gate = nn.Linear(d_model, 1, bias=False)  # W_{N+1} in R^{1 x D}
 
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.router(x)  # (B, T, N)
-        s = self.softmax(logits)  # (B, T, N)
         g_shared = torch.sigmoid(self.shared_gate(x))  # (B, T, 1)
-        return s, g_shared
+        return logits, g_shared
 
 
 class MOELayer(nn.Module):
@@ -231,8 +271,8 @@ class MOELayer(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.k = k
-        d_expert = hidden_size // 2 if d_expert is None else d_expert
-        d_ff = hidden_size // 2 if d_ff is None else d_ff
+        d_ff = hidden_size * 4 if d_ff is None else d_ff
+        d_expert = d_ff // k if d_expert is None else d_expert
 
         self.router = Router(hidden_size, num_experts)
 
@@ -247,8 +287,9 @@ class MOELayer(nn.Module):
         N = B * T
 
         # apply router and normalize weights
-        # router_scores: (B,T,N), shared_expert_score: (B,T,1)
-        router_scores, shared_expert_score = self.router(hidden_state)
+        # router_logits: (B,T,N), shared_expert_score: (B,T,1)
+        router_logits, shared_expert_score = self.router(hidden_state)
+        router_scores = torch.softmax(router_logits, dim=-1, dtype=torch.float32).to(hidden_state.dtype)
         topk_vals, topk_idx = torch.topk(router_scores, k=self.k)
 
         # TODO: Consider adding the renomalization back in
@@ -330,14 +371,17 @@ class MOELayer(nn.Module):
 class BatchedExperts(torch.nn.Module):
     def __init__(self, num_experts, hidden, ff):
         super().__init__()
-        self.w1 = torch.nn.Parameter(torch.randn(num_experts, hidden, ff))
-        self.w2 = torch.nn.Parameter(torch.randn(num_experts, ff, hidden))
+        self.w_gate = torch.nn.Parameter(torch.randn(num_experts, hidden, ff))
+        self.w_up = torch.nn.Parameter(torch.randn(num_experts, hidden, ff))
+        self.w_down = torch.nn.Parameter(torch.randn(num_experts, ff, hidden))
+        self.act = torch.nn.SiLU()
 
     def forward(self, x):
         # x: [E, C, H]
-        x = torch.bmm(x, self.w1)
-        x = torch.nn.functional.gelu(x)
-        x = torch.bmm(x, self.w2)
+        gate = torch.bmm(x, self.w_gate)
+        up = torch.bmm(x, self.w_up)
+        x = self.act(gate) * up
+        x = torch.bmm(x, self.w_down)
         return x
 
 
@@ -370,8 +414,8 @@ class EfficientMOELayer(nn.Module):
         cap = math.ceil(max_batch_tokens * k / num_experts * self.capacity_factor)
         self.capacity = max(1, int(cap))
 
-        d_expert = hidden_size // 2 if d_expert is None else d_expert
-        d_ff = hidden_size // 2 if d_ff is None else d_ff
+        d_ff = hidden_size * 4 if d_ff is None else d_ff
+        d_expert = d_ff // k if d_expert is None else d_expert
 
         self.router = Router(hidden_size, num_experts)
         self.experts = BatchedExperts(num_experts, hidden_size, d_expert)
@@ -390,7 +434,8 @@ class EfficientMOELayer(nn.Module):
         C = self.capacity
 
         # Route tokens to experts and select top-k assignments
-        router_scores, shared_expert_score = self.router(hidden_state)  # [B,T,E], [B,T,1]
+        router_logits, shared_expert_score = self.router(hidden_state)  # [B,T,E], [B,T,1]
+        router_scores = torch.softmax(router_logits, dim=-1, dtype=torch.float32).to(hidden_state.dtype)
         topk_vals, topk_idx = torch.topk(router_scores, k=K, dim=-1)  # [B,T,K], [B,T,K]
 
         # Flatten tokens and build per-route metadata (token, expert, gate)

@@ -38,17 +38,21 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seq-max-len", type=int, default=4096)
     parser.add_argument("--seq-stride", type=int, default=4096)
     parser.add_argument("--normalization-func", choices=["max", "zero"], default="zero")
+    parser.add_argument("--pack-sequences", action="store_true")
+    parser.add_argument("--pack-buckets", default=None)
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--n-decoder-layers", type=int, default=4)
+    parser.add_argument("--input-size", type=int, default=1)
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--num-expert-layers", type=int, default=1)
     parser.add_argument("--k", type=int, default=2)
     parser.add_argument("--n-head", type=int, default=8)
     parser.add_argument("--d-ff", type=int, default=None)
     parser.add_argument("--d-expert", type=int, default=None)
+    parser.add_argument("--moe-impl", choices=["efficient", "standard", "megablocks"], default="efficient")
     parser.add_argument("--patch", action="store_true")
     parser.add_argument("--patch-len", type=int, default=32)
     parser.add_argument("--patch-stride", type=int, default=32)
@@ -108,15 +112,21 @@ def _validate_required(args: argparse.Namespace, required: list[str]) -> None:
 
 
 def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
+    pack_buckets = None
+    if args.pack_buckets:
+        pack_buckets = [int(item) for item in args.pack_buckets.split(",") if item.strip()]
     dataset_config = DatasetConfig(
         dataset_path=args.dataset_path,
         seq_max_len=args.seq_max_len,
         seq_stride=args.seq_stride,
         normalization_func=args.normalization_func,
+        pack_sequences=args.pack_sequences,
+        pack_buckets=pack_buckets,
     )
     model_config = ModelConfig(
         hidden_size=args.hidden_size,
         n_decoder_layers=args.n_decoder_layers,
+        input_size=args.input_size,
         patch=args.patch,
         patch_len=args.patch_len,
         patch_stride=args.patch_stride,
@@ -126,6 +136,7 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         n_head=args.n_head,
         d_ff=args.d_ff,
         d_expert=args.d_expert,
+        moe_impl=args.moe_impl,
     )
     train_config = TrainingConfig(
         model_config=model_config,

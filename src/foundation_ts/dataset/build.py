@@ -14,6 +14,8 @@ def build_ts_dataset(
     normalization_method: Optional[Callable | str] = None,
     use_mmap: bool = True,
     mmap_cache_size: int = 32,
+    pack_sequences: bool = False,
+    pack_buckets: Optional[list[int]] = None,
 ) -> WindowedDataset:
     """Build a windowed dataset from local files or a dataset folder."""
     normalizer = resolve_normalizer(normalization_method)
@@ -21,4 +23,11 @@ def build_ts_dataset(
         data_path, transform=normalizer, use_mmap=use_mmap, mmap_cache_size=mmap_cache_size
     )
     concat_dataset = ConcatSequenceDataset(datasets)
-    return WindowedDataset(concat_dataset, context_length=max_length, prediction_length=0, stride=stride)
+    return WindowedDataset(
+        concat_dataset,
+        context_length=max_length,
+        prediction_length=0,
+        stride=stride,
+        pack_sequences=pack_sequences,
+        pack_buckets=pack_buckets,
+    )

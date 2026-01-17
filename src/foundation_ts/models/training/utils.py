@@ -4,6 +4,8 @@ from foundation_ts.models.tsmoe.stats import MoEStats
 
 
 def aux_loss(stats: MoEStats):
+    if stats.extras and "moe_aux" in stats.extras:
+        return stats.extras["moe_aux"]
     N = stats.importance.numel()
     return N * torch.sum(stats.importance * stats.load)
 
@@ -20,6 +22,9 @@ def _prepare_batch(batch: dict[str, torch.Tensor], device: torch.device) -> tupl
     input_ids = batch["input_ids"].to(device, non_blocking=True)
     labels = batch["labels"].to(device, non_blocking=True)
     loss_masks = batch["loss_masks"].to(device, non_blocking=True)
+    segment_ids = batch.get("segment_ids")
+    if segment_ids is not None:
+        segment_ids = segment_ids.to(device, non_blocking=True)
 
     if input_ids.dim() == 2:
         input_ids = input_ids.unsqueeze(-1)
@@ -28,7 +33,7 @@ def _prepare_batch(batch: dict[str, torch.Tensor], device: torch.device) -> tupl
     if loss_masks.dim() == 3 and loss_masks.size(-1) == 1:
         loss_masks = loss_masks.squeeze(-1)
 
-    return input_ids, labels, loss_masks
+    return input_ids, labels, loss_masks, segment_ids
 
 
 def _build_attention_mask(
@@ -57,15 +62,22 @@ def _patch_labels_and_masks(
 def _build_horizon_targets(
     labels: torch.Tensor, loss_masks: torch.Tensor, horizon: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T = labels.shape
-    targets = torch.zeros((B, T, horizon), device=labels.device, dtype=labels.dtype)
-    masks = torch.zeros((B, T, horizon), device=labels.device, dtype=labels.dtype)
+    if labels.dim() == 2:
+        B, T = labels.shape
+        C = 1
+    else:
+        B, T, C = labels.shape
+    targets = torch.zeros((B, T, horizon, C), device=labels.device, dtype=labels.dtype)
+    masks = torch.zeros((B, T, horizon, 1), device=labels.device, dtype=labels.dtype)
     for offset in range(horizon):
         valid_len = T - offset
         if valid_len <= 0:
             break
-        targets[:, :valid_len, offset] = labels[:, offset:]
-        masks[:, :valid_len, offset] = loss_masks[:, offset:].to(labels.dtype)
+        if labels.dim() == 2:
+            targets[:, :valid_len, offset, 0] = labels[:, offset:]
+        else:
+            targets[:, :valid_len, offset] = labels[:, offset:]
+        masks[:, :valid_len, offset, 0] = loss_masks[:, offset:].to(labels.dtype)
     return targets, masks
 
 
@@ -85,6 +97,12 @@ def _forecast_loss(
     total = torch.zeros((), device=labels.device)
     for horizon, pred in outputs.items():
         targets, masks = _build_horizon_targets(labels, loss_masks, horizon)
+        input_size = pred.size(-1) // horizon
+        pred = pred.view(pred.size(0), pred.size(1), horizon, input_size)
+        if targets.size(-1) == 1 and input_size > 1:
+            targets = targets.expand(-1, -1, -1, input_size)
+        if masks.size(-1) == 1 and input_size > 1:
+            masks = masks.expand(-1, -1, -1, input_size)
         per_item = loss_fn(pred, targets) * masks
         denom = masks.sum().clamp(min=1.0)
         total = total + per_item.sum() / denom
