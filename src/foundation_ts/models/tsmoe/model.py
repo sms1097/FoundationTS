@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from foundation_ts.models.tsmoe.layers import Attention, EfficientMOELayer, MOELayer, RMSNorm
+from foundation_ts.models.tsmoe.layers import Attention, LogicalDenseMOE, PerExpertMOE, RMSNorm
 from foundation_ts.models.tsmoe.stats import MoEStats
 
 
@@ -70,6 +70,7 @@ class MOEDecoderLayer(nn.Module):
         num_expert_layers: int,
         n_head: int,
         k: int,
+        attention_backend: str = "flash",
         d_ff: int | None = None,
         d_expert: int | None = None,
         moe_m_tile: int = 1,
@@ -80,15 +81,22 @@ class MOEDecoderLayer(nn.Module):
     ):
         super().__init__()
         if moe_impl == "efficient" and max_batch_tokens is None:
-            raise ValueError("max_batch_tokens is required for EfficientMOELayer.")
+            raise ValueError("max_batch_tokens is required for LogicalDenseMOE.")
         self.num_experts = num_experts
         self.rms_norm1 = RMSNorm(hidden_size)
 
-        self.attention = Attention(hidden_size, n_head)
+        self.attention = Attention(hidden_size, n_head, backend=attention_backend)
         self.rms_norm2 = RMSNorm(hidden_size)
+        if moe_impl == "efficient":
+            moe_cls = LogicalDenseMOE
+        elif moe_impl == "standard":
+            moe_cls = PerExpertMOE
+        else:
+            raise ValueError(f"Unsupported moe_impl={moe_impl!r}.")
+
         self.expert_layers = nn.ModuleList(
             [
-                EfficientMOELayer(
+                moe_cls(
                     hidden_size,
                     num_experts,
                     k,
@@ -98,6 +106,15 @@ class MOEDecoderLayer(nn.Module):
                     d_expert=d_expert,
                     capacity_factor=capacity_factor,
                     drop_policy=drop_policy,
+                )
+                if moe_cls is LogicalDenseMOE
+                else moe_cls(
+                    hidden_size,
+                    num_experts,
+                    k,
+                    moe_m_tile=moe_m_tile,
+                    d_ff=d_ff,
+                    d_expert=d_expert,
                 )
                 for _ in range(num_expert_layers)
             ]
@@ -141,6 +158,7 @@ class TSMOE(nn.Module):
         patch: bool = False,
         patch_len: int = 32,
         patch_stride: int = 32,
+        attention_backend: str = "flash",
         d_ff: int | None = None,
         d_expert: int | None = None,
         moe_m_tile: int = 1,
@@ -151,7 +169,7 @@ class TSMOE(nn.Module):
     ):
         super().__init__()
         if max_batch_tokens is None:
-            raise ValueError("max_batch_tokens is required for EfficientMOELayer.")
+            raise ValueError("max_batch_tokens is required for LogicalDenseMOE.")
 
         self.num_experts = num_experts
         self.embed_layer = TimeEmbedding(hidden_size, input_size, patch, patch_len, patch_stride)
@@ -162,6 +180,7 @@ class TSMOE(nn.Module):
                 num_expert_layers,
                 n_head,
                 k,
+                attention_backend=attention_backend,
                 d_ff=d_ff,
                 d_expert=d_expert,
                 moe_m_tile=moe_m_tile,

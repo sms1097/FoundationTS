@@ -139,15 +139,19 @@ class RotaryEmbedding(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int, backend: str = "flash"):
         super().__init__()
         assert num_heads >= 1, f"Number of attention heads must be >= 1, got {num_heads}"
         assert hidden_size % num_heads == 0, (
             f"hidden size must be divisible by n_head, hidden_size={hidden_size}, n_head={num_heads}"
         )
 
+        if backend not in ("flash", "sdpa"):
+            raise ValueError(f"Unsupported attention backend: {backend}")
+
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.backend = backend
         self.rotary_emb = RotaryEmbedding(self.head_dim)
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -180,28 +184,45 @@ class Attention(nn.Module):
         # batch, seq_len, n_head, head_dim
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # total_tokens, 3, n_head, head_dim
-        qkv = (
-            torch.stack((q, k, v), dim=2)
-            .permute(0, 3, 2, 1, 4)
-            .reshape(batch_size * seq_len, 3, self.num_heads, self.head_dim)
-        )
+        if self.backend == "flash":
+            # total_tokens, 3, n_head, head_dim
+            qkv = (
+                torch.stack((q, k, v), dim=2)
+                .permute(0, 3, 2, 1, 4)
+                .reshape(batch_size * seq_len, 3, self.num_heads, self.head_dim)
+            )
 
-        if segment_ids is None:
-            indices, cu_seqlens, max_seqlen = _get_unpad_data(attention_mask)
+            if segment_ids is None:
+                indices, cu_seqlens, max_seqlen = _get_unpad_data(attention_mask)
+            else:
+                indices, cu_seqlens, max_seqlen = _get_segment_unpad_data(attention_mask, segment_ids)
+
+            qkv = qkv.index_select(0, indices)
+
+            attn_out = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=True)
+            padded = torch.zeros(
+                (batch_size * seq_len, self.num_heads, self.head_dim),
+                device=attn_out.device,
+                dtype=attn_out.dtype,
+            )
+            padded.index_copy_(0, indices, attn_out)
+            attn_out = padded.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         else:
-            indices, cu_seqlens, max_seqlen = _get_segment_unpad_data(attention_mask, segment_ids)
-
-        qkv = qkv.index_select(0, indices)
-
-        attn_out = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=True)
-        padded = torch.zeros(
-            (batch_size * seq_len, self.num_heads, self.head_dim),
-            device=attn_out.device,
-            dtype=attn_out.dtype,
-        )
-        padded.index_copy_(0, indices, attn_out)
-        attn_out = padded.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            if segment_ids is not None:
+                raise ValueError("segment_ids are not supported with SDPA attention backend.")
+            attn_mask = None
+            if attention_mask is not None:
+                key_padding = attention_mask == 0
+                if key_padding.any():
+                    attn_mask = key_padding[:, None, None, :]
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                is_causal=True,
+            )
+            attn_out = attn_out.swapaxes(1, 2)
 
         # attn_mask = None
         # if attention_mask is not None:
@@ -259,18 +280,20 @@ class Router(nn.Module):
         return logits, g_shared
 
 
-class MOELayer(nn.Module):
+class PerExpertMOE(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         num_experts: int,
         k: int,
+        moe_m_tile: int = 1,
         d_ff: int | None = None,
         d_expert: int | None = None,
     ):
         super().__init__()
         self.num_experts = num_experts
         self.k = k
+        self.moe_m_tile = max(1, int(moe_m_tile))
         d_ff = hidden_size * 4 if d_ff is None else d_ff
         d_expert = d_ff // k if d_expert is None else d_expert
 
@@ -319,15 +342,20 @@ class MOELayer(nn.Module):
         token_sorted = token_for_route[compute_order]
         x_sorted = x[token_sorted]
 
-        # Apply the experts on grouped data
+        # Apply the experts on grouped data, with per-expert token rounding.
         counts = torch.bincount(expert_sorted, minlength=self.num_experts)
         offsets = torch.cumsum(counts, dim=0)
         starts = offsets - counts
 
-        y_sorted = torch.empty_like(x_sorted)
+        if self.moe_m_tile > 1:
+            keep_limit = counts - (counts % self.moe_m_tile)
+        else:
+            keep_limit = counts
+
+        y_sorted = torch.zeros_like(x_sorted)
 
         for i, exp in enumerate(self.expert_layers):
-            s_i, t = starts[i], offsets[i]
+            s_i, t = starts[i], starts[i] + keep_limit[i]
             if s_i == t:
                 continue
 
@@ -349,19 +377,16 @@ class MOELayer(nn.Module):
             y_out = y_out * attention_mask.unsqueeze(-1).to(y_out.dtype)
 
         # aux loss specifics
+        if keep_limit.sum() > 0:
+            load = keep_limit / (keep_limit.sum() + 1e-12)
+        else:
+            load = torch.zeros(self.num_experts, device=counts.device, dtype=router_scores.dtype)
         if attention_mask is None:
-            load = counts / (counts.sum() + 1e-12)  # (N,)
             importance = router_scores.mean(dim=(0, 1))
-            # importance = router_scores.mean(dim=(0, 1))
         else:
             flat_mask = attention_mask.reshape(N).to(device=router_scores.device)
             denom = flat_mask.sum() + 1e-12
             importance = (router_scores * flat_mask.view(B, T, 1)).sum(dim=(0, 1)) / denom
-            if expert_for_route.numel():
-                masked_counts = torch.bincount(expert_for_route, minlength=self.num_experts)
-                load = masked_counts / (masked_counts.sum() + 1e-12)
-            else:
-                load = torch.zeros(self.num_experts, device=counts.device, dtype=router_scores.dtype)
 
         stats.add_values_(importance, load)
 
@@ -385,7 +410,7 @@ class BatchedExperts(torch.nn.Module):
         return x
 
 
-class EfficientMOELayer(nn.Module):
+class LogicalDenseMOE(nn.Module):
     """
     Compile-friendly MoE with fixed expert capacity and vectorized dispatch.
     """
@@ -472,12 +497,9 @@ class EfficientMOELayer(nn.Module):
         r = torch.arange(expert_sorted.numel(), device=hidden_state.device)
         positions = r - starts[expert_sorted]
 
-        # Enforce fixed capacity and round down to the nearest multiple of moe_m_tile.
+        # Enforce fixed capacity (no token rounding for dense-capacity routing).
         cap_counts = torch.minimum(counts, counts.new_full(counts.shape, C))
-        if self.moe_m_tile > 1:
-            keep_limit = cap_counts - (cap_counts % self.moe_m_tile)
-        else:
-            keep_limit = cap_counts
+        keep_limit = cap_counts
         in_cap = positions < keep_limit[expert_sorted]  # [R] bool
         nonzero = gate_sorted != 0
         keep = in_cap & nonzero
@@ -551,3 +573,7 @@ class EfficientMOELayer(nn.Module):
         stats.add_values_(importance, load)
 
         return y_out, stats
+
+
+MOELayer = PerExpertMOE
+EfficientMOELayer = LogicalDenseMOE

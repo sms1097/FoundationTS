@@ -50,11 +50,12 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-expert-layers", type=int, default=1)
     parser.add_argument("--k", type=int, default=2)
     parser.add_argument("--n-head", type=int, default=8)
+    parser.add_argument("--attn-backend", choices=["flash", "sdpa"], default="flash")
     parser.add_argument("--d-ff", type=int, default=None)
     parser.add_argument("--d-expert", type=int, default=None)
     parser.add_argument("--moe-m-tile", type=int, default=1)
     parser.add_argument("--capacity-factor", type=float, default=1.3)
-    parser.add_argument("--moe-impl", choices=["efficient", "standard", "megablocks"], default="efficient")
+    parser.add_argument("--moe-impl", choices=["efficient", "standard"], default="efficient")
     parser.add_argument("--patch", action="store_true")
     parser.add_argument("--patch-len", type=int, default=32)
     parser.add_argument("--patch-stride", type=int, default=32)
@@ -136,6 +137,7 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         num_expert_layers=args.num_expert_layers,
         k=args.k,
         n_head=args.n_head,
+        attention_backend=args.attn_backend,
         d_ff=args.d_ff,
         d_expert=args.d_expert,
         moe_m_tile=args.moe_m_tile,

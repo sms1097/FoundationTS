@@ -24,6 +24,7 @@ class ModelConfig:
     num_expert_layers: int = 1
     k: int = 2
     n_head: int = 8
+    attention_backend: str = "flash"
     d_ff: int | None = None
     d_expert: int | None = None
     moe_m_tile: int = 1

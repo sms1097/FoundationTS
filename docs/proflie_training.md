@@ -1361,3 +1361,64 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.30
 ```
 
 So results aren't good, but we can train, it does something! I will revisit to train (TBH, probably there are a lot of model performance tricks I'm sure to improve performance).
+
+## Next Day
+
+I want to get a nice set of comparisons to understand perf differences. 
+
+We will run with the following model:
+
+```
+foundationts train \
+  --dataset-path time300b_selected \
+  --steps-per-epoch 80 \
+  --epochs 1 \
+  --batch-size 52 \
+  --seq-max-len 4096 \
+  --seq-stride 4096 \
+  --num-expert-layers 1 \
+  --hidden-size 384 \
+  --n-head 12 \
+  --n-decoder-layers 12 \
+  --num-experts 8 \
+  --k 2 \
+  --d-ff 1536 \
+  --d-expert 768 \
+  --log-every 10 \
+  --checkpoint-every 0 \
+  --log-perf-metrics \
+  --mfu-peak-tflops 989 \
+  --compile
+```
+
+
+```
+- Dense sanity (3 rows)
+  - Dense FFN (bf16)
+  - Dense FFN + FA
+  - Dense FFN + FA + compile
+
+- MoE progression (4 rows)
+  - MoE naive routing (bf16)
+  - MoE naive routing + compile
+  - MoE scatter routing
+  - MoE scatter routing + compile ← headline
+
+- Capacity / tile sweeps (6 rows)
+  - scatter+compile + cap=0.9
+  - scatter+compile + cap=1.1
+  - scatter+compile + cap=1.5
+  - scatter+compile + tile=64
+  - scatter+compile + tile=128
+
+- Expert Layer tests
+  - PerExpertMOE
+    - tile=1 (no rounding)
+    - tile=64
+    - tile=128
+  - LogicalDense
+    - cap=0.9
+    - cap=1.1
+    - cap=1.3
+    - cap=1.5
+```

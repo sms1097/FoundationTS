@@ -21,7 +21,7 @@ from foundation_ts.models.training.utils import (
     aux_loss,
 )
 from foundation_ts.models.tsmoe import TSMOE
-from foundation_ts.models.tsmoe.layers import EfficientMOELayer
+from foundation_ts.models.tsmoe.layers import LogicalDenseMOE, PerExpertMOE
 
 
 def _get_device(device: str | None) -> torch.device:
@@ -173,6 +173,7 @@ def _build_model(model_config, device: torch.device, max_batch_tokens: int) -> T
         num_expert_layers=model_config.num_expert_layers,
         k=model_config.k,
         n_head=model_config.n_head,
+        attention_backend=model_config.attention_backend,
         horizons=model_config.horizons,
         d_ff=model_config.d_ff,
         d_expert=model_config.d_expert,
@@ -423,7 +424,7 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
     expert_params = 0
     active_expert_params = 0.0
     for module in model.modules():
-        if isinstance(module, EfficientMOELayer):
+        if isinstance(module, LogicalDenseMOE):
             layer_expert_params = sum(p.numel() for p in module.experts.parameters())
             expert_params += layer_expert_params
             if module.num_experts:
@@ -469,7 +470,7 @@ def estimate_transformer_moe_executed_flops(
         flops += 4.0 * batch_size * seq_len * seq_len * hidden_size
 
         for expert_layer in layer.expert_layers:
-            if not isinstance(expert_layer, EfficientMOELayer):
+            if not isinstance(expert_layer, LogicalDenseMOE):
                 continue
             num_experts = expert_layer.num_experts
             k = expert_layer.k
@@ -488,7 +489,6 @@ def estimate_transformer_moe_executed_flops(
             d_expert = expert_layer.experts.w_gate.shape[2]
             avg_routes_per_expert = (n_tokens * k) / max(1, num_experts)
             kept_per_expert = min(capacity, int(avg_routes_per_expert))
-            kept_per_expert -= kept_per_expert % m_tile
             total_expert_tokens = num_experts * capacity
             flops += 6.0 * total_expert_tokens * hidden_size * d_expert
 
