@@ -429,6 +429,11 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
             expert_params += layer_expert_params
             if module.num_experts:
                 active_expert_params += layer_expert_params * (module.k / module.num_experts)
+        elif isinstance(module, PerExpertMOE):
+            layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
+            expert_params += layer_expert_params
+            if module.num_experts:
+                active_expert_params += layer_expert_params * (module.k / module.num_experts)
     active_params = int(round(total_params - expert_params + active_expert_params))
     return total_params, active_params
 
