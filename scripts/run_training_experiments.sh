@@ -43,87 +43,103 @@ run_case() {
   "${BASE_ARGS[@]}" "$@" 2>&1 | tee "$log_file"
 }
 
-# Dense sanity (note: flash-attn is always used in Attention; no separate flag today).
-run_case "dense_ffn_bf16_sdpa" \
-  --num-experts 1 \
-  --k 1 \
-  --moe-impl standard \
-  --attn-backend sdpa
+# run_case "dense_ffn_bf16_sdpa" \
+#   --num-experts 1 \
+#   --k 1 \
+#   --moe-impl standard \
+#   --attn-backend sdpa
 
-run_case "dense_ffn_bf16_flash" \
-  --num-experts 1 \
-  --k 1 \
-  --moe-impl standard \
-  --attn-backend flash
+# run_case "dense_ffn_bf16_flash" \
+#   --num-experts 1 \
+#   --k 1 \
+#   --moe-impl standard \
+#   --attn-backend flash
 
-run_case "dense_ffn_bf16_flash_compile" \
-  --num-experts 1 \
-  --k 1 \
-  --moe-impl standard \
-  --attn-backend flash \
-  --compile
+# run_case "dense_ffn_bf16_flash_compile" \
+#   --num-experts 1 \
+#   --k 1 \
+#   --moe-impl standard \
+#   --attn-backend flash \
+#   --compile
 
-# MoE progression.
-run_case "moe_naive_bf16" \
-  --moe-impl standard
+# run_case "dense_compute_matched_moe_active" \
+#   --num-experts 1 \
+#   --k 1 \
+#   --moe-impl standard \
+#   --d-expert 1536 \
+#   --compile
 
-run_case "moe_naive_bf16_compile" \
-  --moe-impl standard \
-  --compile
+# # MoE progression.
+# run_case "moe_naive_bf16" \
+#   --moe-impl standard
 
-run_case "moe_scatter_bf16" \
-  --moe-impl efficient
+# run_case "moe_naive_bf16_compile" \
+#   --moe-impl standard \
+#   --compile
 
-run_case "moe_scatter_bf16_compile" \
-  --moe-impl efficient \
-  --compile
+# run_case "moe_onehot_bf16" \
+#   --moe-impl onehot
 
-# Capacity / tile sweeps (scatter + compile).
-run_case "scatter_compile_cap_0_9" \
-  --moe-impl efficient \
-  --capacity-factor 0.9 \
-  --compile
+# run_case "moe_onehot_bf16_compile" \
+#   --moe-impl onehot \
+#   --compile
 
-run_case "scatter_compile_cap_1_1" \
-  --moe-impl efficient \
-  --capacity-factor 1.1 \
-  --compile
+# run_case "moe_scatter_bf16" \
+#   --moe-impl efficient
 
-run_case "scatter_compile_cap_1_5" \
-  --moe-impl efficient \
-  --capacity-factor 1.5 \
-  --compile
+# run_case "moe_scatter_bf16_compile" \
+#   --moe-impl efficient \
+#   --compile
 
-run_case "scatter_compile_tile_64" \
-  --moe-impl efficient \
-  --moe-m-tile 64 \
-  --compile
+# # Capacity / tile sweeps (scatter + compile).
+# run_case "scatter_compile_cap_0_9" \
+#   --moe-impl efficient \
+#   --capacity-factor 0.9 \
+#   --compile
 
-run_case "scatter_compile_tile_128" \
-  --moe-impl efficient \
-  --moe-m-tile 128 \
-  --compile
+# run_case "scatter_compile_cap_1_1" \
+#   --moe-impl efficient \
+#   --capacity-factor 1.1 \
+#   --compile
 
-# Expert layer tests.
-run_case "per_expert_tile_1" \
-  --moe-impl standard \
-  --moe-m-tile 1
+# run_case "scatter_compile_cap_1_5" \
+#   --moe-impl efficient \
+#   --capacity-factor 1.5 \
+#   --compile
 
-run_case "per_expert_tile_64" \
-  --moe-impl standard \
-  --moe-m-tile 64
+# run_case "scatter_compile_tile_64" \
+#   --moe-impl efficient \
+#   --moe-m-tile 64 \
+#   --compile
 
-run_case "per_expert_tile_128" \
-  --moe-impl standard \
-  --moe-m-tile 128
+# run_case "scatter_compile_tile_128" \
+#   --moe-impl efficient \
+#   --moe-m-tile 128 \
+#   --compile
 
-run_case "logical_dense_cap_0_9" \
-  --moe-impl efficient \
-  --capacity-factor 0.9
+# # Expert layer tests.
+# run_case "per_expert_tile_1" \
+#   --moe-impl standard \
+#   --moe-m-tile 1 \
+#   --compile
 
-run_case "logical_dense_cap_1_1" \
-  --moe-impl efficient \
-  --capacity-factor 1.1
+# run_case "per_expert_tile_64" \
+#   --moe-impl standard \
+#   --moe-m-tile 64 \
+#   --compile
+
+# run_case "per_expert_tile_128" \
+#   --moe-impl standard \
+#   --moe-m-tile 128 \
+#   --compile
+
+# run_case "logical_dense_cap_0_9" \
+#   --moe-impl efficient \
+#   --capacity-factor 0.9
+
+# run_case "logical_dense_cap_1_1" \
+#   --moe-impl efficient \
+#   --capacity-factor 1.1
 
 run_case "logical_dense_cap_1_3" \
   --moe-impl efficient \

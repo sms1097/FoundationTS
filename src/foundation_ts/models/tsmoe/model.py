@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from foundation_ts.models.tsmoe.layers import Attention, LogicalDenseMOE, PerExpertMOE, RMSNorm
+from foundation_ts.models.tsmoe.layers import Attention, LogicalDenseMOE, PerExpertMOE, PerExpertOneHotMOE, RMSNorm
 from foundation_ts.models.tsmoe.stats import MoEStats
 
 
@@ -91,6 +91,8 @@ class MOEDecoderLayer(nn.Module):
             moe_cls = LogicalDenseMOE
         elif moe_impl == "standard":
             moe_cls = PerExpertMOE
+        elif moe_impl == "onehot":
+            moe_cls = PerExpertOneHotMOE
         else:
             raise ValueError(f"Unsupported moe_impl={moe_impl!r}.")
 

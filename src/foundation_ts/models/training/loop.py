@@ -1,16 +1,15 @@
 import math
 import random
-import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
-import pynvml
 import torch
 from torch.utils.data import DataLoader, Sampler, Subset, random_split
 
 from foundation_ts.dataset import build_ts_dataset
 from foundation_ts.models.training.config import RunnerConfig
+from foundation_ts.models.training.perf import PerfMetricsTracker, build_perf_profiler
 from foundation_ts.models.training.utils import (
     _build_attention_mask,
     _build_horizon_targets,
@@ -21,7 +20,7 @@ from foundation_ts.models.training.utils import (
     aux_loss,
 )
 from foundation_ts.models.tsmoe import TSMOE
-from foundation_ts.models.tsmoe.layers import LogicalDenseMOE, PerExpertMOE
+from foundation_ts.models.tsmoe.layers import LogicalDenseMOE, PerExpertMOE, PerExpertOneHotMOE
 
 
 def _get_device(device: str | None) -> torch.device:
@@ -305,20 +304,6 @@ def _build_profiler(train_config, device: torch.device, checkpoint_dir: Path):
     return profiler
 
 
-def _build_perf_profiler(train_config, device: torch.device):
-    if not train_config.log_perf_metrics or train_config.profile:
-        return None
-    if device.type != "cuda":
-        return None
-    return torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-    )
-
-
 @torch.no_grad()
 def _run_validation(
     model: TSMOE,
@@ -429,7 +414,7 @@ def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
             expert_params += layer_expert_params
             if module.num_experts:
                 active_expert_params += layer_expert_params * (module.k / module.num_experts)
-        elif isinstance(module, PerExpertMOE):
+        elif isinstance(module, (PerExpertMOE, PerExpertOneHotMOE)):
             layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
             expert_params += layer_expert_params
             if module.num_experts:
@@ -521,56 +506,6 @@ def _format_precision(train_config, device: torch.device) -> str:
     if device.type == "cuda" and train_config.use_amp and train_config.use_bf16:
         return "bf16"
     return "fp32"
-
-
-def _count_cuda_events(events: list[object]) -> int:
-    count = 0
-    for evt in events:
-        device_type = getattr(evt, "device_type", None)
-        if device_type is None:
-            continue
-        if isinstance(device_type, str):
-            is_cuda = device_type.lower() == "cuda"
-        else:
-            is_cuda = str(device_type).lower().endswith("cuda")
-        if is_cuda:
-            count += 1
-    return count
-
-
-def _bytes_to_gib(value: float) -> float:
-    return value / (1024.0**3)
-
-
-class _NvmlUtilTracker:
-    def __init__(self, device: torch.device, enabled: bool) -> None:
-        self.enabled = bool(enabled and device.type == "cuda" and pynvml is not None)
-        self.handle = None
-        if not self.enabled:
-            return
-        try:
-            pynvml.nvmlInit()
-            index = device.index if device.index is not None else 0
-            self.handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-        except Exception:
-            self.enabled = False
-
-    def snapshot(self) -> dict[str, float] | None:
-        if not self.enabled or self.handle is None:
-            return None
-        try:
-            util = pynvml.nvmlDeviceGetUtilizationRates(self.handle)
-            return {"sm_util": float(util.gpu), "mem_util": float(util.memory)}
-        except Exception:
-            return None
-
-    def shutdown(self) -> None:
-        if not self.enabled:
-            return
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
 
 
 def _train_microbatches(
@@ -686,31 +621,28 @@ def train(config: RunnerConfig) -> TSMOE:
 
     model.train()
     checkpoint_dir = Path(train_config.checkpoint_dir)
-    last_log_time = time.time()
-    tokens_since_log = 0
-    steps_since_log = 0
-    step_time_since_log = 0.0
     accum_steps = max(1, train_config.grad_accum_steps)
     use_amp = train_config.use_amp and train_config.use_bf16 and device.type == "cuda"
     autocast_dtype = torch.bfloat16 if use_amp else None
-    if device.type == "cuda" and train_config.log_perf_metrics:
-        torch.cuda.reset_peak_memory_stats(device)
-    nvml_tracker = _NvmlUtilTracker(device, train_config.log_perf_metrics)
-    peak_vram_bytes = 0.0
-    kernel_launches_total = 0
-    kernel_steps_total = 0
+    perf_tracker = PerfMetricsTracker(
+        device=device,
+        perf_enabled=train_config.log_perf_metrics,
+        flops_per_token=flops_per_token,
+        peak_flops=peak_flops,
+        gpu_name=gpu_name,
+        precision=precision,
+    )
 
     profiler = _build_profiler(train_config, device, checkpoint_dir)
-    perf_profiler = _build_perf_profiler(train_config, device)
+    perf_profiler = build_perf_profiler(train_config, device)
     active_profiler = profiler or perf_profiler
     profiler_ctx = active_profiler if active_profiler is not None else nullcontext()
     kernel_profiler = active_profiler if train_config.log_perf_metrics else None
-    last_kernel_event_count = 0
 
     data_iter = iter(data_loader)
     with profiler_ctx:
         for step_idx in range(start_step, total_steps):
-            step_start = time.perf_counter() if train_config.log_perf_metrics else None
+            step_start = perf_tracker.start_step()
             optimizer.zero_grad(set_to_none=True)
             (
                 accum_total,
@@ -734,11 +666,9 @@ def train(config: RunnerConfig) -> TSMOE:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
             optimizer.step()
             scheduler.step()
-            if step_start is not None:
-                step_time_since_log += time.perf_counter() - step_start
+            perf_tracker.finish_step(step_start)
             global_step = step_idx + 1
-            tokens_since_log += accum_tokens
-            steps_since_log += 1
+            perf_tracker.record_step(accum_tokens)
 
             avg_total = accum_total / accum_steps
             avg_pred = accum_pred / accum_steps
@@ -748,59 +678,8 @@ def train(config: RunnerConfig) -> TSMOE:
                 active_profiler.step()
 
             if train_config.log_every and global_step % train_config.log_every == 0:
-                now = time.time()
-                elapsed = max(1e-6, now - last_log_time)
-                toks_per_sec = tokens_since_log / elapsed
                 lr = optimizer.param_groups[0]["lr"]
-                if device.type == "cuda" and train_config.log_perf_metrics:
-                    peak_vram_bytes = max(peak_vram_bytes, torch.cuda.max_memory_reserved(device))
-                tflops = None
-                mfu = None
-                step_time_ms = None
-                sm_util = None
-                hbm_util = None
-                mem_ctrl_util = None
-                kernel_launches_per_step = None
-                if train_config.log_perf_metrics:
-                    tflops = (toks_per_sec * flops_per_token) / 1e12
-                    if peak_flops:
-                        mfu = (toks_per_sec * flops_per_token) / peak_flops
-                    if steps_since_log > 0:
-                        step_time_ms = (step_time_since_log / steps_since_log) * 1000.0
-                    util_stats = nvml_tracker.snapshot()
-                    if util_stats is not None:
-                        sm_util = util_stats.get("sm_util")
-                        hbm_util = util_stats.get("mem_util")
-                        mem_ctrl_util = util_stats.get("mem_util")
-                    if kernel_profiler is not None:
-                        try:
-                            events = kernel_profiler.events()
-                        except Exception:
-                            events = None
-                        if events:
-                            event_count = _count_cuda_events(events)
-                            delta = event_count - last_kernel_event_count
-                            if delta > 0 and steps_since_log > 0:
-                                kernel_launches_per_step = delta / steps_since_log
-                                kernel_launches_total += delta
-                                kernel_steps_total += steps_since_log
-                            last_kernel_event_count = event_count
-                perf_parts = []
-                if tflops is not None:
-                    perf_parts.append(f"tflops={tflops:.2f}")
-                if mfu is not None:
-                    perf_parts.append(f"mfu={mfu * 100:.2f}%")
-                if step_time_ms is not None:
-                    perf_parts.append(f"step_ms={step_time_ms:.2f}")
-                if sm_util is not None:
-                    perf_parts.append(f"sm_util={sm_util:.1f}%")
-                if hbm_util is not None:
-                    perf_parts.append(f"hbm_util={hbm_util:.1f}%")
-                if mem_ctrl_util is not None:
-                    perf_parts.append(f"mem_ctrl_util={mem_ctrl_util:.1f}%")
-                if kernel_launches_per_step is not None:
-                    perf_parts.append(f"kernels/step={kernel_launches_per_step:.1f}")
-                perf_str = f" {' '.join(perf_parts)}" if perf_parts else ""
+                toks_per_sec, perf_str = perf_tracker.build_log(kernel_profiler)
                 avg_total_val = float(avg_total)
                 avg_pred_val = float(avg_pred)
                 avg_aux_val = float(avg_aux)
@@ -809,10 +688,6 @@ def train(config: RunnerConfig) -> TSMOE:
                     f"pred={avg_pred_val:.4f} aux={avg_aux_val:.4f} "
                     f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{perf_str}"
                 )
-                last_log_time = now
-                tokens_since_log = 0
-                steps_since_log = 0
-                step_time_since_log = 0.0
 
             if train_config.val_every and global_step % train_config.val_every == 0:
                 if val_loader is not None:
@@ -854,14 +729,7 @@ def train(config: RunnerConfig) -> TSMOE:
                 _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
 
     if train_config.log_perf_metrics:
-        if device.type == "cuda":
-            peak_vram_bytes = max(peak_vram_bytes, torch.cuda.max_memory_reserved(device))
-        summary_parts = [f"model={gpu_name}", f"precision={precision}"]
-        if device.type == "cuda":
-            summary_parts.append(f"peak_vram_gb={_bytes_to_gib(peak_vram_bytes):.2f}")
-        if kernel_steps_total > 0:
-            kernel_avg = kernel_launches_total / kernel_steps_total
-            summary_parts.append(f"kernels/step={kernel_avg:.1f}")
+        summary_parts = perf_tracker.finish()
         print(f"run {' '.join(summary_parts)}")
 
     if profiler is not None:
@@ -869,5 +737,5 @@ def train(config: RunnerConfig) -> TSMOE:
         print("top_kernels")
         print(profiler.key_averages().table(sort_by=sort_key, row_limit=10))
 
-    nvml_tracker.shutdown()
+    perf_tracker.shutdown()
     return model

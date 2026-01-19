@@ -55,7 +55,7 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--d-expert", type=int, default=None)
     parser.add_argument("--moe-m-tile", type=int, default=1)
     parser.add_argument("--capacity-factor", type=float, default=1.3)
-    parser.add_argument("--moe-impl", choices=["efficient", "standard"], default="efficient")
+    parser.add_argument("--moe-impl", choices=["efficient", "standard", "onehot"], default="efficient")
     parser.add_argument("--patch", action="store_true")
     parser.add_argument("--patch-len", type=int, default=32)
     parser.add_argument("--patch-stride", type=int, default=32)

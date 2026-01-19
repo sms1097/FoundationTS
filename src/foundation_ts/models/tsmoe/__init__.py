@@ -1,4 +1,4 @@
-from foundation_ts.models.tsmoe.layers import Attention, LogicalDenseMOE, PerExpertMOE, RMSNorm
+from foundation_ts.models.tsmoe.layers import Attention, LogicalDenseMOE, PerExpertMOE, PerExpertOneHotMOE, RMSNorm
 from foundation_ts.models.tsmoe.model import (
     TSMOE,
     MOEDecoderLayer,
@@ -11,6 +11,7 @@ __all__ = [
     "LogicalDenseMOE",
     "MOEDecoderLayer",
     "PerExpertMOE",
+    "PerExpertOneHotMOE",
     "MultiHorizonOutputLayer",
     "RMSNorm",
     "TSMOE",

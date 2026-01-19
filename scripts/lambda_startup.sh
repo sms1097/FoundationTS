@@ -11,6 +11,6 @@ python -m pip install --upgrade pip setuptools wheel
 
 pip install torch psutil
 pip install --no-build-isolation flash-attn
-pip install .
+pip install -e .
 
 foundationts data download
