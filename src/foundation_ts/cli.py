@@ -7,7 +7,29 @@ from foundation_ts.models.training.config import DatasetConfig, ModelConfig, Run
 from foundation_ts.models.training.loop import train
 
 DEBUG_PARTITIONS = ["other/m4_daily", "healthcare/hospital", "sales/dominick"]
-TRAIN_PARTITION_SET = ["energy*", "nature*", "synthetic*", "web*", "sales*", "finance*"]
+TRAIN_PARTITION_SET = [
+    "nature/beijing_air_quality",
+    "nature/china_air_quality",
+    "nature/era5_1998",
+    "nature/era5_1999",
+    "nature/era5_2000",
+    "nature/era5_2001",
+    "nature/era5_2002",
+    "nature/era5_2003",
+    "nature/era5_2004",
+    "nature/era5_2005",
+    "nature/era5_2006",
+    "nature/era5_2007",
+    "nature/cmip6_1850",
+    "nature/cmip6_1900",
+    "nature/cmip6_1950",
+    "nature/cmip6_2000",
+    "nature/cmip6_2010",
+    "energy/**",
+    "synthetic/**",
+    "web/**",
+    "sales/**",
+]
 PARTITION_SETS = {"debug": DEBUG_PARTITIONS, "train": TRAIN_PARTITION_SET}
 
 
@@ -16,15 +38,22 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seq-max-len", type=int, default=4096)
     parser.add_argument("--seq-stride", type=int, default=4096)
     parser.add_argument("--normalization-func", choices=["max", "zero"], default="zero")
+    parser.add_argument("--pack-sequences", action="store_true")
+    parser.add_argument("--pack-buckets", default=None)
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--n-decoder-layers", type=int, default=4)
+    parser.add_argument("--input-size", type=int, default=1)
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--num-expert-layers", type=int, default=1)
     parser.add_argument("--k", type=int, default=2)
     parser.add_argument("--n-head", type=int, default=8)
+    parser.add_argument("--attn-backend", choices=["flash", "sdpa"], default="flash")
+    parser.add_argument("--d-ff", type=int, default=None)
+    parser.add_argument("--d-expert", type=int, default=None)
+    parser.add_argument("--moe-m-tile", type=int, default=1)
     parser.add_argument("--patch", action="store_true")
     parser.add_argument("--patch-len", type=int, default=32)
     parser.add_argument("--patch-stride", type=int, default=32)
@@ -46,6 +75,7 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--aux-loss-weight", type=float, default=0.02)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int, default=10_000)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-split", type=float, default=0.01)
@@ -57,9 +87,7 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume-checkpoint", default=None)
-    parser.add_argument("--tensorboard", action="store_true", default=True)
-    parser.add_argument("--no-tensorboard", action="store_true")
-    parser.add_argument("--tensorboard-dir", default=None)
+    parser.add_argument("--mfu-peak-tflops", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--pin-memory", action="store_true", default=True)
@@ -81,15 +109,21 @@ def _validate_required(args: argparse.Namespace, required: list[str]) -> None:
 
 
 def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
+    pack_buckets = None
+    if args.pack_buckets:
+        pack_buckets = [int(item) for item in args.pack_buckets.split(",") if item.strip()]
     dataset_config = DatasetConfig(
         dataset_path=args.dataset_path,
         seq_max_len=args.seq_max_len,
         seq_stride=args.seq_stride,
         normalization_func=args.normalization_func,
+        pack_sequences=args.pack_sequences,
+        pack_buckets=pack_buckets,
     )
     model_config = ModelConfig(
         hidden_size=args.hidden_size,
         n_decoder_layers=args.n_decoder_layers,
+        input_size=args.input_size,
         patch=args.patch,
         patch_len=args.patch_len,
         patch_stride=args.patch_stride,
@@ -97,6 +131,10 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         num_expert_layers=args.num_expert_layers,
         k=args.k,
         n_head=args.n_head,
+        attention_backend=args.attn_backend,
+        d_ff=args.d_ff,
+        d_expert=args.d_expert,
+        moe_m_tile=args.moe_m_tile,
     )
     train_config = TrainingConfig(
         model_config=model_config,
@@ -108,6 +146,7 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         beta1=args.beta1,
         beta2=args.beta2,
         aux_loss_weight=args.aux_loss_weight,
+        max_grad_norm=args.max_grad_norm,
         warmup_steps=args.warmup_steps,
         grad_accum_steps=args.grad_accum_steps,
         device=args.device,
@@ -122,8 +161,7 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=args.checkpoint_dir,
         resume_from_checkpoint=args.resume_checkpoint,
-        tensorboard=(args.tensorboard and not args.no_tensorboard),
-        tensorboard_dir=args.tensorboard_dir,
+        mfu_peak_tflops=args.mfu_peak_tflops,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=(args.pin_memory and not args.no_pin_memory),

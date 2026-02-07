@@ -8,12 +8,15 @@ class DatasetConfig:
     seq_max_len: int = 4096
     seq_stride: int = 4096
     normalization_func: Literal["max", "zero"] = "zero"
+    pack_sequences: bool = False
+    pack_buckets: list[int] | None = None
 
 
 @dataclass
 class ModelConfig:
     hidden_size: int
     n_decoder_layers: int
+    input_size: int = 1
     patch: bool = False
     patch_len: int = 32
     patch_stride: int = 32
@@ -21,6 +24,10 @@ class ModelConfig:
     num_expert_layers: int = 1
     k: int = 2
     n_head: int = 8
+    attention_backend: str = "flash"
+    d_ff: int | None = None
+    d_expert: int | None = None
+    moe_m_tile: int = 1
     horizons: list[int] = field(default_factory=lambda: [1, 8, 32, 64])
 
 
@@ -54,9 +61,8 @@ class TrainingConfig:
     val_every: int = 1000
     checkpoint_every: int = 2000
     checkpoint_dir: str = "checkpoints"
-    tensorboard: bool = True
-    tensorboard_dir: str | None = None
     resume_from_checkpoint: str | None = None
+    mfu_peak_tflops: float | None = None
 
 
 @dataclass

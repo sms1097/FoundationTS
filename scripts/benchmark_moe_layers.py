@@ -32,7 +32,9 @@ def _ensure_cuda() -> torch.device:
 def _estimate_active_params(layer: torch.nn.Module) -> tuple[int, int]:
     total_params = sum(p.numel() for p in layer.parameters())
     expert_params = 0
-    if hasattr(layer, "expert_layers"):
+    if hasattr(layer, "experts"):
+        expert_params = sum(p.numel() for p in layer.experts.parameters())
+    elif hasattr(layer, "expert_layers"):
         expert_params = sum(p.numel() for p in layer.expert_layers.parameters())
     if getattr(layer, "num_experts", 0):
         active_expert_params = expert_params * (layer.k / layer.num_experts)
@@ -164,7 +166,7 @@ def main() -> None:
 
     layers = [
         (
-            "PerExpertMOE",
+            "MOELayer",
             MOELayer(
                 hidden_size=HIDDEN_SIZE,
                 num_experts=NUM_EXPERTS,
