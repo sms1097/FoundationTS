@@ -1,0 +1,5 @@
+*cache*
+.vscode
+*.egg-info/
+checkpoints
+time300b_selected

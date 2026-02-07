@@ -22,6 +22,7 @@ foundationts train \
   --n-head 12 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1671
 ```
 
@@ -31,10 +32,12 @@ Outputs:
 Notes:
 - Profiling always collects Python stacks.
 - The schedule is fixed: wait=10, warmup=10, active=1, repeat=1.
+- Use `--compile` to enable `torch.compile` for steady-state performance tests.
 
 
 ### Performance metrics
 
+Use `--log-perf-metrics` to print step-level performance stats to stdout:
 - `train/toks_per_sec`
 - `train/step_time_ms`
 - `train/tflops`
@@ -121,6 +124,7 @@ foundationts train \
   --d-expert 3072 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979
 ```
 
@@ -148,6 +152,7 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 Yay! SO that is working!
 
 ### Compiled
+Same command as above but with `--compile`
 
 ```
 params total=538.13M (538,130,793) active=198.39M (198,392,169)
@@ -495,6 +500,15 @@ Benchmark settings batch=512 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloa
 MOELayer
   params total=2.36M (2,363,904) active=791.04K (791,040)
   toks/s=15,880,819 step_ms=132.06 tflops=150.75
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=16,034,768 step_ms=130.79 tflops=152.21
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=26,188,956 step_ms=80.08 tflops=248.60
+AdaptiveMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=10,492,107 step_ms=199.88 tflops=99.60
 ```
 
 
@@ -504,6 +518,15 @@ Benchmark settings batch=512 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloa
 MOELayer
   params total=2.36M (2,363,904) active=791.04K (791,040)
   toks/s=15,830,824 step_ms=132.47 tflops=150.27
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=2,301,000 step_ms=911.41 tflops=21.84
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=2,399,856 step_ms=873.87 tflops=22.78
+AdaptiveMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=13,139,833 step_ms=159.60 tflops=124.73
 ```
 
 So the attention mask just kills performance!
@@ -552,6 +575,12 @@ Benchmark settings batch=128 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloa
 MOELayer
   params total=2.36M (2,363,904) active=791.04K (791,040)
   toks/s=16,968,051 step_ms=30.90 tflops=161.07
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=13,112,611 step_ms=39.98 tflops=124.47
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=16,326,827 step_ms=32.11 tflops=154.98
 ```
 
 This is better, but not really where we want to be.
@@ -568,6 +597,12 @@ Benchmark settings batch=128 seq=4096 hidden=512 experts=8 k=2 dtype=torch.bfloa
 MOELayer
   params total=2.36M (2,363,904) active=791.04K (791,040)
   toks/s=16,942,215 step_ms=30.95 tflops=160.82
+EfficientMOELayer
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=17,116,561 step_ms=30.63 tflops=162.48
+EfficientMOELayer (compiled)
+  params total=2.36M (2,363,904) active=791.04K (791,040)
+  toks/s=20,727,827 step_ms=25.29 tflops=196.76
 ```
 
 
@@ -576,7 +611,7 @@ MOELayer
 #### MoE routing examples
 
 Below are small, self-contained snippets that mirror the routing changes we tested in
-`PerExpertMOE` for performance debugging.
+`EfficientMOELayer` for performance debugging.
 
 Baseline gather (index_select on a flattened buffer):
 
@@ -721,7 +756,9 @@ foundationts train \
   --d-expert 3072 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
+  --compile
 ```
 
 Trace file is `big_mfu_gain.json`.
@@ -770,7 +807,9 @@ foundationts train \
   --d-expert 1536 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
+  --compile
 ```
 
 
@@ -809,8 +848,10 @@ foundationts train \
   --d-expert 1536 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
   --pack-sequences \
+  --compile 
 ```
 
 ```
@@ -846,7 +887,9 @@ foundationts train \
   --d-expert 1536 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
+  --profile
 ```
 
 
@@ -883,7 +926,10 @@ foundationts train \
   --d-expert 1536 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
+  --profile \
+  --compile
 
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
@@ -902,6 +948,7 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=61.35 kernels/step=5
 
 with pack sequences, no compile
 ```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 18   --seq-max-len 4096   --seq-stride 4096   --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --profile --pack-sequences
 
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
@@ -920,6 +967,7 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=73.87 kernels/step=1
 Sequence packign with compile
 
 ```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 18   --seq-max-len 4096   --seq-stride 4096   --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --profile --pack-sequences --compile
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5950.9756 pred=5947.9683 aux=150.3554 lr=1.00e-06 toks/s=72,723 tflops=173.13 mfu=8.75% step_ms=846.99 sm_util=99.0% hbm_util=65.0% mem_ctrl_util=65.0%
@@ -955,7 +1003,9 @@ foundationts train \
   --d-expert 1536 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
+  --profile \
   --pack-sequences \
   --pack-buckets 4096
 
@@ -992,7 +1042,9 @@ That's still really bad. Let's with only one pack bucket:
   --d-expert 1536 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 1979 \
+  --profile \
   --pack-sequences \
   --pack-buckets 4096
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
@@ -1037,6 +1089,7 @@ There's a bug with how I'm calculating capacity. Here is the diff:
 
 
 ```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --compile
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5714.7065 pred=5711.7275 aux=148.9415 lr=1.00e-06 toks/s=39,978 tflops=95.18 mfu=4.81% step_ms=2105.83 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
@@ -1093,6 +1146,7 @@ The “fused op” idea is a grouped 1x1 Conv1d implementation: we reshape [E,C,
 
 
 ```
+((py312) ) ubuntu@192-222-55-188:~/FoundationTS$ foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979   --compile --moe-m-tile 128
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5685.3545 pred=5682.1230 aux=161.5728 lr=1.00e-06 toks/s=55,049 tflops=131.05 mfu=6.62% step_ms=1473.55 sm_util=98.0% hbm_util=68.0% mem_ctrl_util=68.0%
@@ -1108,6 +1162,7 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.30
 
 It doesn't make a difference. I want to see what kind of difference capacity factor makes:
 ```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979 --moe-m-tile 128 --compile --capacity-factor 1.5
 
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
@@ -1125,6 +1180,7 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=74.05
 
 
 ```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 1979 --moe-m-tile 128 --compile --capacity-factor 1.1
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5704.0186 pred=5700.7891 aux=161.4736 lr=1.00e-06 toks/s=58,163 tflops=138.47 mfu=7.00% step_ms=1392.21 sm_util=98.0% hbm_util=67.0% mem_ctrl_util=67.0%
@@ -1141,6 +1197,8 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=71.04
 
 ```
  foundationts train   --dataset-path time300b_selected   --steps-per-epoch 80   --epochs 1   --batch-size 24   --seq-max-len 4096   --seq-strid
+e 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-p
+eak-tflops 1979 --moe-m-tile 128 --compile --capacity-factor 0.9
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5794.5264 pred=5791.4209 aux=155.2703 lr=1.00e-06 toks/s=42,325 tflops=100.76 mfu=5.09% step_ms=2161.24 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
@@ -1161,6 +1219,7 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=72.91
 I was using the wrong theoretical tflops, because I don't exploit sparsity. My actual max tflops are 989, and I added a function estimate how many flops my model is doing per pass.
 
 ```
+foundationts train   --dataset-path time300b_selected   --steps-per-epoch 200   --epochs 1   --batch-size 24   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-experts 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 989 --moe-m-tile 64 --compile --capacity-factor 0.9
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5810.2383 pred=5807.1323 aux=155.2937 lr=1.00e-06 toks/s=80,250 tflops=127.77 mfu=12.92% step_ms=1057.48 sm_util=98.0% hbm_util=66.0% mem_ctrl_util=66.0%
@@ -1193,6 +1252,8 @@ run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=72.45
 ```
 ((py312) ) ubuntu@192-222-55-188:~/FoundationTS$ foundationts train   --dataset-path time300b_selected   --steps-per-epoch 1000   --epo
 chs 1   --batch-size 22   --seq-max-len 4096   --seq-stride 4096 --hidden-size 768   --n-decoder-layers 12   --n-head 12   --num-expert
+s 8   --k 2   --d-ff 3072   --d-expert 1536   --log-every 10   --checkpoint-every 0   --log-perf-metrics   --mfu-peak-tflops 989 --moe-
+m-tile 64 --compile --capacity-factor 1.25
 params total=453.20M (453,196,137) active=198.39M (198,392,169)
 device model=NVIDIA H100 80GB HBM3 precision=bf16
 step=10 loss=5699.4336 pred=5696.2012 aux=161.6187 lr=1.00e-06 toks/s=73,422 tflops=129.99 mfu=13.14% step_ms=1061.18 sm_util=98.0% hbm_util=69.0% mem_ctrl_util=69.0%
@@ -1325,7 +1386,9 @@ foundationts train \
   --d-expert 768 \
   --log-every 10 \
   --checkpoint-every 0 \
+  --log-perf-metrics \
   --mfu-peak-tflops 989 \
+  --compile
 ```
 
 
