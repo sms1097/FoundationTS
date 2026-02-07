@@ -1,0 +1,11 @@
+params total=113.35M (113,351,913) active=49.65M (49,650,921)
+device model=NVIDIA H100 80GB HBM3 precision=bf16
+step=10 loss=3.4978 pred=0.5873 aux=145.5253 lr=1.00e-06 toks/s=185,288 tflops=108.94 mfu=11.02% step_ms=554.92 sm_util=99.0% hbm_util=72.0% mem_ctrl_util=72.0%
+step=20 loss=3.3936 pred=0.5049 aux=144.4386 lr=2.00e-06 toks/s=341,313 tflops=200.68 mfu=20.29% step_ms=383.26 sm_util=99.0% hbm_util=71.0% mem_ctrl_util=71.0%
+step=30 loss=3.3832 pred=0.4989 aux=144.2181 lr=3.00e-06 toks/s=339,479 tflops=199.60 mfu=20.18% step_ms=385.27 sm_util=89.0% hbm_util=63.0% mem_ctrl_util=63.0%
+step=40 loss=3.3481 pred=0.4652 aux=144.1430 lr=4.00e-06 toks/s=341,320 tflops=200.68 mfu=20.29% step_ms=383.33 sm_util=85.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=50 loss=3.2637 pred=0.3845 aux=143.9583 lr=5.00e-06 toks/s=346,514 tflops=203.74 mfu=20.60% step_ms=377.51 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=60 loss=3.2388 pred=0.3622 aux=143.8262 lr=6.00e-06 toks/s=344,050 tflops=202.29 mfu=20.45% step_ms=380.32 sm_util=86.0% hbm_util=57.0% mem_ctrl_util=57.0%
+step=70 loss=3.2394 pred=0.3521 aux=144.3649 lr=7.00e-06 toks/s=338,761 tflops=199.18 mfu=20.14% step_ms=386.13 sm_util=99.0% hbm_util=71.0% mem_ctrl_util=71.0%
+step=80 loss=3.2182 pred=0.3406 aux=143.8817 lr=8.00e-06 toks/s=339,824 tflops=199.80 mfu=20.20% step_ms=384.98 sm_util=96.0% hbm_util=69.0% mem_ctrl_util=69.0%
+run model=NVIDIA H100 80GB HBM3 precision=bf16 peak_vram_gb=66.55
