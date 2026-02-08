@@ -6,7 +6,7 @@ import torch
 try:
     from flash_attn import flash_attn_varlen_qkvpacked_func
 except Exception:
-    flash_attn = None
+    flash_attn_varlen_qkvpacked_func = None
 
 from torch import nn
 from torch.nn import functional as F
@@ -183,6 +183,10 @@ class Attention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if self.backend == "flash":
+            if flash_attn_varlen_qkvpacked_func is None:
+                if torch.cuda.is_available():
+                    raise RuntimeError("flash-attn is required when CUDA is available.")
+                raise RuntimeError("flash-attn is not available. Use --attn-backend sdpa on CPU.")
             # total_tokens, 3, n_head, head_dim
             qkv = (
                 torch.stack((q, k, v), dim=2)

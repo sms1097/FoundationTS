@@ -197,7 +197,7 @@ def _handle_download(args: argparse.Namespace) -> None:
             if not partitions:
                 raise ValueError("--partitions provided but empty after parsing.")
         else:
-            partitions = TRAIN_PARTITION_SET
+            partitions = TRAIN_PARTITION_SET + VALIDATION_SET
         print(f"Downloading Time-300B partitions to {args.time300b_dir}...")
 
         local_dir = Path(args.time300b_dir)

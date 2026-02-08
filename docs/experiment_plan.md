@@ -57,3 +57,7 @@ Always log:
   - Compare early changes at 10% compute budget
 - compute-to-target table (time/GPU-hours to reach baseline quality)
 - throughput + memory + stability notes
+
+
+## Command
+
