@@ -56,6 +56,7 @@ class TrainingConfig:
     val_split: float = 0.01
     val_max_batches: int = 10
     ood_val_dataset_path: str | None = None
+    ood_val_partitions: list[str] | None = None
     ood_val_max_batches: int = 10
     log_every: int = 50
     val_every: int = 1000
@@ -63,6 +64,12 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
     resume_from_checkpoint: str | None = None
     mfu_peak_tflops: float | None = None
+    max_wall_time_s: float | None = None
+    final_val_on_budget: bool = False
+    final_ckpt_on_budget: bool = True
+    ddp: bool = False
+    ddp_backend: str | None = None
+    ddp_find_unused_parameters: bool = False
 
 
 @dataclass

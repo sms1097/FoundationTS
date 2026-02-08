@@ -6,7 +6,6 @@ from huggingface_hub import snapshot_download
 from foundation_ts.models.training.config import DatasetConfig, ModelConfig, RunnerConfig, TrainingConfig
 from foundation_ts.models.training.loop import train
 
-DEBUG_PARTITIONS = ["other/m4_daily", "healthcare/hospital", "sales/dominick"]
 TRAIN_PARTITION_SET = [
     "nature/beijing_air_quality",
     "nature/china_air_quality",
@@ -30,7 +29,7 @@ TRAIN_PARTITION_SET = [
     "web/**",
     "sales/**",
 ]
-PARTITION_SETS = {"debug": DEBUG_PARTITIONS, "train": TRAIN_PARTITION_SET}
+VALIDATION_SET = ["finance/**", "other/**", "healthcare/**"]
 
 
 def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
@@ -81,6 +80,7 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--val-split", type=float, default=0.01)
     parser.add_argument("--val-max-batches", type=int, default=10)
     parser.add_argument("--ood-val-dataset-path", default=None)
+    parser.add_argument("--ood-val-partitions", default=None)
     parser.add_argument("--ood-val-max-batches", type=int, default=10)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=1000)
@@ -88,6 +88,12 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--mfu-peak-tflops", type=float, default=None)
+    parser.add_argument("--max-wall-time-s", type=float, default=None)
+    parser.add_argument("--final-val-on-budget", action="store_true")
+    parser.add_argument("--no-final-ckpt-on-budget", action="store_true")
+    parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--ddp-backend", default=None)
+    parser.add_argument("--ddp-find-unused-parameters", action="store_true")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--pin-memory", action="store_true", default=True)
@@ -95,7 +101,6 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_download_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--partition-set", choices=sorted(PARTITION_SETS.keys()), default="train")
     parser.add_argument("--partitions", default=None)
     parser.add_argument("--time300b-dir", default="time300b_selected")
     parser.add_argument("--no-time300b", action="store_true")
@@ -136,6 +141,15 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         d_expert=args.d_expert,
         moe_m_tile=args.moe_m_tile,
     )
+    ood_val_partitions = None
+    if args.ood_val_partitions:
+        ood_val_partitions = [p.strip() for p in args.ood_val_partitions.split(",") if p.strip()]
+        if not ood_val_partitions:
+            raise ValueError("--ood-val-partitions provided but empty after parsing.")
+    ood_val_dataset_path = args.ood_val_dataset_path
+    if ood_val_partitions and not ood_val_dataset_path:
+        ood_val_dataset_path = args.dataset_path
+
     train_config = TrainingConfig(
         model_config=model_config,
         epochs=args.epochs,
@@ -154,7 +168,8 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         use_bf16=not args.no_bf16,
         val_split=args.val_split,
         val_max_batches=args.val_max_batches,
-        ood_val_dataset_path=args.ood_val_dataset_path,
+        ood_val_dataset_path=ood_val_dataset_path,
+        ood_val_partitions=ood_val_partitions,
         ood_val_max_batches=args.ood_val_max_batches,
         log_every=args.log_every,
         val_every=args.val_every,
@@ -162,6 +177,12 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         checkpoint_dir=args.checkpoint_dir,
         resume_from_checkpoint=args.resume_checkpoint,
         mfu_peak_tflops=args.mfu_peak_tflops,
+        max_wall_time_s=args.max_wall_time_s,
+        final_val_on_budget=args.final_val_on_budget,
+        final_ckpt_on_budget=not args.no_final_ckpt_on_budget,
+        ddp=args.ddp,
+        ddp_backend=args.ddp_backend,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=(args.pin_memory and not args.no_pin_memory),
@@ -176,7 +197,7 @@ def _handle_download(args: argparse.Namespace) -> None:
             if not partitions:
                 raise ValueError("--partitions provided but empty after parsing.")
         else:
-            partitions = PARTITION_SETS[args.partition_set]
+            partitions = TRAIN_PARTITION_SET
         print(f"Downloading Time-300B partitions to {args.time300b_dir}...")
 
         local_dir = Path(args.time300b_dir)

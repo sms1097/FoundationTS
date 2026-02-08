@@ -1,3 +1,4 @@
+import fnmatch
 import json
 import os
 import re
@@ -229,8 +230,25 @@ def discover_sequence_datasets(
     transform: Optional[Callable] = None,
     use_mmap: bool = True,
     mmap_cache_size: int = 32,
+    include_patterns: Optional[list[str]] = None,
 ) -> list[SequenceDataset]:
     """Discover and load datasets from a file or directory."""
+    normalized_patterns = None
+    if include_patterns:
+        normalized_patterns = [pattern.replace("\\", "/") for pattern in include_patterns]
+
+    def _matches_path(rel_path: str, is_dir: bool) -> bool:
+        if not normalized_patterns:
+            return True
+        if any(fnmatch.fnmatch(rel_path, pattern) for pattern in normalized_patterns):
+            return True
+        if is_dir:
+            prefix = rel_path + "/"
+            for pattern in normalized_patterns:
+                if pattern.startswith(prefix):
+                    return True
+        return False
+
     if BinarySequenceDataset.is_valid_path(data_path):
         return [
             BinarySequenceDataset(
@@ -247,12 +265,18 @@ def discover_sequence_datasets(
     for root, dirs, files in os.walk(data_path):
         for file in files:
             fn_path = os.path.join(root, file)
+            rel_path = os.path.relpath(fn_path, data_path).replace(os.sep, "/")
+            if not _matches_path(rel_path, is_dir=False):
+                continue
             if file != BinarySequenceDataset.meta_file_name and GeneralSequenceDataset.is_valid_path(fn_path):
                 general_ds = GeneralSequenceDataset(fn_path, transform=transform)
                 if len(general_ds) > 0:
                     datasets.append(general_ds)
         for sub_folder in dirs:
             folder_path = os.path.join(root, sub_folder)
+            rel_path = os.path.relpath(folder_path, data_path).replace(os.sep, "/")
+            if not _matches_path(rel_path, is_dir=True):
+                continue
             if BinarySequenceDataset.is_valid_path(folder_path):
                 binary_ds = BinarySequenceDataset(
                     folder_path,

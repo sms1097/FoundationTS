@@ -1,11 +1,17 @@
 import math
+import os
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
+from typing import Callable
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Sampler, Subset, random_split
+from torch.utils.data.distributed import DistributedSampler
 
 from foundation_ts.dataset import build_ts_dataset
 from foundation_ts.models.training.config import RunnerConfig
@@ -26,6 +32,16 @@ def _get_device(device: str | None) -> torch.device:
     if device:
         return torch.device(device)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _is_main_process() -> bool:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
 
 
 class BucketBatchSampler(Sampler[list[int]]):
@@ -72,13 +88,19 @@ class BucketBatchSampler(Sampler[list[int]]):
 
 def _build_dataloaders(
     config: RunnerConfig,
-) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+    *,
+    ddp: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> tuple[DataLoader, DataLoader | None, DataLoader | None, DistributedSampler | None]:
     ds_config = config.dataset_config
     train_config = config.train_config
     if ds_config.pack_buckets and not ds_config.pack_sequences:
         raise ValueError("pack_buckets requires pack_sequences.")
     if ds_config.pack_sequences and train_config.model_config.patch:
         raise ValueError("pack_sequences is not supported with patching enabled.")
+    if ddp and ds_config.pack_buckets:
+        raise ValueError("DDP with pack_buckets is not supported.")
     ds = build_ts_dataset(
         ds_config.dataset_path,
         max_length=ds_config.seq_max_len,
@@ -138,7 +160,29 @@ def _build_dataloaders(
     else:
         train_ds, val_ds = ds, None
 
-    data_loader = _make_loader(train_ds, shuffle=True, drop_last=train_config.drop_last)
+    train_sampler = None
+    if ddp:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=train_config.seed,
+            drop_last=train_config.drop_last,
+        )
+    data_loader = _make_loader(train_ds, shuffle=not ddp, drop_last=train_config.drop_last)
+    if train_sampler is not None:
+        dl_kwargs = dict(
+            batch_size=train_config.batch_size,
+            shuffle=False,
+            drop_last=train_config.drop_last,
+            sampler=train_sampler,
+            num_workers=train_config.num_workers,
+            pin_memory=train_config.pin_memory,
+        )
+        if train_config.num_workers > 0:
+            dl_kwargs["prefetch_factor"] = train_config.prefetch_factor
+        data_loader = DataLoader(train_ds, **dl_kwargs)
 
     val_loader = None
     if val_ds is not None:
@@ -153,10 +197,11 @@ def _build_dataloaders(
             normalization_method=ds_config.normalization_func,
             pack_sequences=ds_config.pack_sequences,
             pack_buckets=ds_config.pack_buckets,
+            include_patterns=train_config.ood_val_partitions,
         )
         ood_val_loader = _make_loader(ood_ds, shuffle=False, drop_last=False)
 
-    return data_loader, val_loader, ood_val_loader
+    return data_loader, val_loader, ood_val_loader, train_sampler
 
 
 def _build_model(model_config, device: torch.device) -> TSMOE:
@@ -226,7 +271,8 @@ def _maybe_resume_from_checkpoint(
     total_steps = train_config.epochs * train_config.steps_per_epoch
     if start_step >= total_steps:
         raise ValueError(f"Checkpoint step {start_step} >= total_steps {total_steps}")
-    print(f"Resumed from {ckpt_path} at step {start_step}")
+    if _is_main_process():
+        print(f"Resumed from {ckpt_path} at step {start_step}")
     return start_step
 
 
@@ -240,10 +286,11 @@ def _save_checkpoint(
 ) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = checkpoint_dir / f"step_{step_idx}.pt"
+    model_state = _unwrap_model(model).state_dict()
     torch.save(
         {
             "step": step_idx,
-            "model_state": model.state_dict(),
+            "model_state": model_state,
             "model_config": asdict(model_config),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
@@ -353,10 +400,11 @@ def _format_param_count(value: int) -> str:
 
 
 def _estimate_active_params(model: torch.nn.Module) -> tuple[int, int]:
-    total_params = sum(p.numel() for p in model.parameters())
+    unwrapped = _unwrap_model(model)
+    total_params = sum(p.numel() for p in unwrapped.parameters())
     expert_params = 0
     active_expert_params = 0.0
-    for module in model.modules():
+    for module in unwrapped.modules():
         if isinstance(module, MOELayer):
             layer_expert_params = sum(p.numel() for p in module.expert_layers.parameters())
             expert_params += layer_expert_params
@@ -387,39 +435,30 @@ def _train_microbatches(
     accum_steps: int,
     autocast_dtype,
     aux_weight: float,
+    ddp_no_sync: Callable[[], object] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, object]:
     accum_total = torch.zeros((), device=device)
     accum_pred = torch.zeros((), device=device)
     accum_aux = torch.zeros((), device=device)
     accum_tokens = 0
     for _micro in range(accum_steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(data_loader)
-            batch = next(data_iter)
+        ctx = ddp_no_sync() if (ddp_no_sync is not None and _micro < accum_steps - 1) else nullcontext()
+        with ctx:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(data_loader)
+                batch = next(data_iter)
 
-        input_ids, labels, loss_masks, segment_ids = _prepare_batch(batch, device)
-        attention_mask = _build_attention_mask(
-            loss_masks,
-            model_config.patch,
-            model_config.patch_len,
-            model_config.patch_stride,
-        )
-
-        if autocast_dtype is None:
-            outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
-            pred_loss = _forecast_loss(
-                outputs,
-                labels,
+            input_ids, labels, loss_masks, segment_ids = _prepare_batch(batch, device)
+            attention_mask = _build_attention_mask(
                 loss_masks,
-                loss_fn,
-                patch=model_config.patch,
-                patch_len=model_config.patch_len,
-                patch_stride=model_config.patch_stride,
+                model_config.patch,
+                model_config.patch_len,
+                model_config.patch_stride,
             )
-        else:
-            with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+
+            if autocast_dtype is None:
                 outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
                 pred_loss = _forecast_loss(
                     outputs,
@@ -430,10 +469,22 @@ def _train_microbatches(
                     patch_len=model_config.patch_len,
                     patch_stride=model_config.patch_stride,
                 )
+            else:
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                    outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
+                    pred_loss = _forecast_loss(
+                        outputs,
+                        labels,
+                        loss_masks,
+                        loss_fn,
+                        patch=model_config.patch,
+                        patch_len=model_config.patch_len,
+                        patch_stride=model_config.patch_stride,
+                    )
 
-        aux = aux_loss(stats)
-        total_loss = pred_loss + aux_weight * aux
-        (total_loss / accum_steps).backward()
+            aux = aux_loss(stats)
+            total_loss = pred_loss + aux_weight * aux
+            (total_loss / accum_steps).backward()
 
         accum_total += total_loss.detach()
         accum_pred += pred_loss.detach()
@@ -453,26 +504,58 @@ def train(config: RunnerConfig) -> TSMOE:
 
     train_config = config.train_config
     model_config = train_config.model_config
-    device = _get_device(train_config.device)
+    ddp_enabled = train_config.ddp
+    if ddp_enabled:
+        if not dist.is_available():
+            raise RuntimeError("DDP requested but torch.distributed is not available.")
+        if not dist.is_initialized():
+            backend = train_config.ddp_backend
+            if backend is None:
+                backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cpu")
+    else:
+        rank = 0
+        world_size = 1
+        device = _get_device(train_config.device)
 
-    _set_seed(train_config.seed)
+    seed = train_config.seed
+    if seed is not None and ddp_enabled:
+        seed = seed + rank
+    _set_seed(seed)
 
-    data_loader, val_loader, ood_val_loader = _build_dataloaders(config)
+    data_loader, val_loader, ood_val_loader, train_sampler = _build_dataloaders(
+        config,
+        ddp=ddp_enabled,
+        rank=rank,
+        world_size=world_size,
+    )
     model = _build_model(model_config, device)
     total_params, active_params = _estimate_active_params(model)
     flops_per_token = _estimate_flops_per_token(active_params)
     peak_flops = train_config.mfu_peak_tflops * 1e12 if train_config.mfu_peak_tflops else None
-    print(
-        "params "
-        f"total={_format_param_count(total_params)} ({total_params:,}) "
-        f"active={_format_param_count(active_params)} ({active_params:,})"
-    )
-    if device.type == "cuda":
-        gpu_name = torch.cuda.get_device_name(device)
-    else:
-        gpu_name = "cpu"
-    precision = _format_precision(train_config, device)
-    print(f"device model={gpu_name} precision={precision}")
+    if ddp_enabled:
+        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None,
+                    find_unused_parameters=train_config.ddp_find_unused_parameters)
+    if _is_main_process():
+        print(
+            "params "
+            f"total={_format_param_count(total_params)} ({total_params:,}) "
+            f"active={_format_param_count(active_params)} ({active_params:,})"
+        )
+        if device.type == "cuda":
+            gpu_name = torch.cuda.get_device_name(device)
+        else:
+            gpu_name = "cpu"
+        precision = _format_precision(train_config, device)
+        print(f"device model={gpu_name} precision={precision}")
 
     optimizer, scheduler = _build_optimizer_scheduler(model, train_config, device)
     start_step = _maybe_resume_from_checkpoint(model, optimizer, scheduler, train_config, device)
@@ -485,7 +568,32 @@ def train(config: RunnerConfig) -> TSMOE:
     use_amp = train_config.use_amp and train_config.use_bf16 and device.type == "cuda"
     autocast_dtype = torch.bfloat16 if use_amp else None
     data_iter = iter(data_loader)
+    last_epoch = None
+    run_start = time.perf_counter()
+    deadline = None
+    if train_config.max_wall_time_s is not None:
+        if train_config.max_wall_time_s <= 0:
+            print("max_wall_time_s <= 0, skipping training.")
+            return model
+        deadline = run_start + train_config.max_wall_time_s
+        print(f"budget seconds={train_config.max_wall_time_s:.1f}")
+    ema_step_s = None
+    budget_exhausted = False
+    last_global_step = start_step
     for step_idx in range(start_step, total_steps):
+        if train_sampler is not None:
+            epoch_idx = step_idx // train_config.steps_per_epoch
+            if last_epoch != epoch_idx:
+                train_sampler.set_epoch(epoch_idx)
+                last_epoch = epoch_idx
+        if deadline is not None:
+            now = time.perf_counter()
+            est_step = ema_step_s if ema_step_s is not None else 0.0
+            if now + est_step >= deadline:
+                if _is_main_process():
+                    print(f"budget hit: stopping before step={step_idx + 1}")
+                budget_exhausted = True
+                break
         step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         (
@@ -504,6 +612,7 @@ def train(config: RunnerConfig) -> TSMOE:
             accum_steps,
             autocast_dtype,
             train_config.aux_loss_weight,
+            ddp_no_sync=model.no_sync if ddp_enabled else None,
         )
 
         if train_config.max_grad_norm is not None:
@@ -512,12 +621,19 @@ def train(config: RunnerConfig) -> TSMOE:
         scheduler.step()
         step_end = time.perf_counter()
         global_step = step_idx + 1
+        last_global_step = global_step
+
+        step_time = step_end - step_start
+        if ema_step_s is None:
+            ema_step_s = step_time
+        else:
+            ema_step_s = 0.9 * ema_step_s + 0.1 * step_time
 
         avg_total = accum_total / accum_steps
         avg_pred = accum_pred / accum_steps
         avg_aux = accum_aux / accum_steps
 
-        if train_config.log_every and global_step % train_config.log_every == 0:
+        if _is_main_process() and train_config.log_every and global_step % train_config.log_every == 0:
             lr = optimizer.param_groups[0]["lr"]
             elapsed = max(step_end - step_start, 1e-12)
             toks_per_sec = accum_tokens / elapsed
@@ -532,7 +648,13 @@ def train(config: RunnerConfig) -> TSMOE:
                 f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{mfu_str}"
             )
 
-        if train_config.val_every and global_step % train_config.val_every == 0:
+        if deadline is not None and step_end >= deadline:
+            if _is_main_process():
+                print(f"budget hit: stopping after step={global_step}")
+            budget_exhausted = True
+            break
+
+        if _is_main_process() and train_config.val_every and global_step % train_config.val_every == 0:
             if val_loader is not None:
                 val_pred, val_aux, val_mae, val_mse = _run_validation(
                     model,
@@ -568,6 +690,47 @@ def train(config: RunnerConfig) -> TSMOE:
                     f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
                 )
 
-        if train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
+        if _is_main_process() and train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
             _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
+    if budget_exhausted:
+        if _is_main_process() and train_config.final_val_on_budget:
+            if val_loader is not None:
+                val_pred, val_aux, val_mae, val_mse = _run_validation(
+                    model,
+                    val_loader,
+                    device,
+                    loss_fn,
+                    model_config.patch,
+                    model_config.patch_len,
+                    model_config.patch_stride,
+                    max_batches=train_config.val_max_batches,
+                    use_bf16=train_config.use_bf16,
+                    use_amp=train_config.use_amp,
+                )
+                print(
+                    f"val step={last_global_step} pred={val_pred:.4f} aux={val_aux:.4f} "
+                    f"mae={val_mae:.4f} mse={val_mse:.4f}"
+                )
+            if ood_val_loader is not None:
+                ood_pred, ood_aux, ood_mae, ood_mse = _run_validation(
+                    model,
+                    ood_val_loader,
+                    device,
+                    loss_fn,
+                    model_config.patch,
+                    model_config.patch_len,
+                    model_config.patch_stride,
+                    max_batches=train_config.ood_val_max_batches,
+                    use_bf16=train_config.use_bf16,
+                    use_amp=train_config.use_amp,
+                )
+                print(
+                    f"val_ood step={last_global_step} pred={ood_pred:.4f} aux={ood_aux:.4f} "
+                    f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
+                )
+        if _is_main_process() and train_config.final_ckpt_on_budget and last_global_step > 0:
+            _save_checkpoint(checkpoint_dir, last_global_step, model, optimizer, scheduler, model_config)
+    if ddp_enabled and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
     return model

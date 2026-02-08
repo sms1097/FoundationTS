@@ -136,7 +136,7 @@ class TSMOE(nn.Module):
         attention_backend: str = "flash",
         d_ff: int | None = None,
         d_expert: int | None = None,
-        moe_m_tile: int = 1,
+        moe_m_tile: int = 128,
     ):
         super().__init__()
 

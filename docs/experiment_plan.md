@@ -1,172 +1,59 @@
-# Experiment plan
+# Experirements
 
-## Sanity checks
+Goal is to measure perf of the baseline architecture, then see how much we can improve from the baseline.
 
-Quick correctness and profiling runs (around 10 minutes):
+Metrics will be:
 
-1) Debug partition, tiny model, fast val
+- Compare at 25, 50, and 100% of compute budget (GPU Hours)
+- Compare time to cross threshold of metrics (MSE, MAE)
 
-```bash
-foundationts data download --partition-set debug
-foundationts train \
-  --dataset-path time300b_selected \
-  --steps-per-epoch 200 \
-  --epochs 1 \
-  --batch-size 32 \
-  --seq-max-len 512 \
-  --seq-stride 512 \
-  --hidden-size 64 \
-  --n-decoder-layers 2 \
-  --num-experts 2 \
-  --num-expert-layers 1 \
-  --k 1 \
-  --n-head 2 \
-  --val-split 0.01 \
-  --val-every 50 \
-  --val-max-batches 2 \
-  --log-every 10 \
-  --checkpoint-every 0
-```
+Things to test:
 
-2) OOD validation sanity check (finance)
+- **baseline:** TimeMOE with pointwise tokenization
+- Patching
+- Sliding window attention
+- QK normalization
+- FP8 matmuls
+- Batch size schedule
+- Gradient Compression (SquishGrad)
 
-```bash
-foundationts train \
-  --dataset-path time300b_selected \
-  --ood-val-dataset-path time300b_selected/finance \
-  --steps-per-epoch 200 \
-  --epochs 1 \
-  --batch-size 32 \
-  --seq-max-len 512 \
-  --seq-stride 512 \
-  --hidden-size 64 \
-  --n-decoder-layers 2 \
-  --num-experts 2 \
-  --num-expert-layers 1 \
-  --k 1 \
-  --n-head 2 \
-  --val-split 0.01 \
-  --val-every 50 \
-  --val-max-batches 2 \
-  --ood-val-max-batches 2 \
-  --log-every 10 \
-  --checkpoint-every 0
-```
+Model size: 50M active?
 
-## Single-GPU capacity + architecture probes
+## Setup
 
-Goal: find the largest batch/model that fits on one GPU and decide whether pointwise or patch tokenization
-is more efficient for the same model size. Use the same config for both and sweep `--batch-size` until OOM.
+- data mixture + sampling:
+  - TimeMOE dataset
+  - Fev Evaluation datasets
+- context length: 4096 (for variants run at 512)
+- horizon distribution: [1, 8, 32, 64]
+- train budget: 2 GPU hours (H100)
+- metrics: overall + horizon-binned + per-frequency bucket
+- 3 fixed seeds for final comparisons (use 1 seed for early triage)
 
-Model target (roughly TIME-MOE base scale for a single GPU probe):
-- hidden_size 384, n_decoder_layers 12, num_experts 8, num_expert_layers 1, k 2, n_head 12
+Always log:
 
-Paper reference sizes (for scale intuition):
-- base: 12L/12H/8E k=2 dmodel=384 dff=1536 dexpert=192 (50M active / 113M total)
-- large: 12L/12H/8E k=2 dmodel=768 dff=3072 dexpert=384 (200M active / 453M total)
-- ultra: 36L/16H/8E k=2 dmodel=1024 dff=4096 dexpert=512 (1.1B active / 2.4B total)
+- cumulative GPU-seconds
+- tokens/time-points processed
+- effective sequence length (patching changes this)
+- train stability stats (grad norm, loss spikes, expert tokens and router collapses)
+- throughput (tokens/sec) + peak memory
 
-Pointwise tokens (no patch):
+## Architecture and Modeling
 
-```bash
-foundationts train \
-  --dataset-path time300b_selected \
-  --steps-per-epoch 200 \
-  --epochs 1 \
-  --batch-size 128 \
-  --seq-max-len 512 \
-  --seq-stride 512 \
-  --hidden-size 384 \
-  --n-decoder-layers 12 \
-  --num-experts 8 \
-  --num-expert-layers 1 \
-  --k 2 \
-  --n-head 12 \
-  --val-split 0 \
-  --log-every 10 \
-  --checkpoint-every 0
-```
+- Primary model changes to experiment with are the following:
+  - patching
+  - attention variants
+  - QK normalization
+- These will run on 10% training budget.
+- Then follow up with pairwise interactions for the modeling.
+- Scale up to 4096 after we figure out which variable works best
+- Throw in some FP8 training
+- Batch size schedule
 
-Patch tokens (same model, `patch_len=32`):
+## Reporting
 
-```bash
-foundationts train \
-  --dataset-path time300b_selected \
-  --steps-per-epoch 200 \
-  --epochs 1 \
-  --batch-size 128 \
-  --seq-max-len 512 \
-  --seq-stride 512 \
-  --hidden-size 384 \
-  --n-decoder-layers 12 \
-  --num-experts 8 \
-  --num-expert-layers 1 \
-  --k 2 \
-  --n-head 12 \
-  --patch \
-  --patch-len 32 \
-  --patch-stride 32 \
-  --val-split 0 \
-  --log-every 10 \
-  --checkpoint-every 0
-```
-
-If both fit comfortably, increase `--batch-size` (or `--hidden-size`) and re-run until OOM. Use the new
-param count printout to track total vs active params as you scale.
-
-## Real experiments
-
-1) Full train partitions, mid-size model, regular checkpoints
-
-```bash
-foundationts data download --partition-set train
-foundationts train \
-  --dataset-path time300b_selected \
-  --steps-per-epoch 10000 \
-  --epochs 1 \
-  --batch-size 256 \
-  --seq-max-len 4096 \
-  --seq-stride 4096 \
-  --hidden-size 256 \
-  --n-decoder-layers 4 \
-  --num-experts 4 \
-  --num-expert-layers 1 \
-  --k 2 \
-  --n-head 8 \
-  --val-split 0.01 \
-  --val-every 1000 \
-  --val-max-batches 10 \
-  --checkpoint-every 2000
-```
-
-2) Longer run with OOD validation
-
-```bash
-foundationts train \
-  --dataset-path time300b_selected \
-  --ood-val-dataset-path time300b_selected/finance \
-  --steps-per-epoch 10000 \
-  --epochs 3 \
-  --batch-size 256 \
-  --seq-max-len 4096 \
-  --seq-stride 4096 \
-  --hidden-size 256 \
-  --n-decoder-layers 4 \
-  --num-experts 4 \
-  --num-expert-layers 1 \
-  --k 2 \
-  --n-head 8 \
-  --val-split 0.01 \
-  --val-every 1000 \
-  --val-max-batches 10 \
-  --ood-val-max-batches 10 \
-  --checkpoint-every 2000
-```
-
-Notes:
-
-- The Time-300B downloader uses `huggingface_hub.snapshot_download`; set
-  `HUGGINGFACE_HUB_TOKEN` if your environment requires auth.
-- `build_ts_dataset` can load a single file or a directory of supported
-  datasets. See `docs/data.md`.
-
+- metric vs GPU-hours curve (one plot)
+- metric at fixed compute points (0.25×, 0.5×, 1×)
+  - Compare early changes at 10% compute budget
+- compute-to-target table (time/GPU-hours to reach baseline quality)
+- throughput + memory + stability notes

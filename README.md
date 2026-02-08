@@ -190,3 +190,14 @@ The dataset module is heavily inspired by the Time-MoE implementation. Much of t
       url={https://arxiv.org/abs/2409.16040},
 }
 ```
+
+
+
+## Commands
+
+```
+torchrun --nproc_per_node=NUM_GPUS -m foundation_ts.cli train \
+  --ddp \
+  --dataset-path time300b_selected \
+  --epochs 1
+```
