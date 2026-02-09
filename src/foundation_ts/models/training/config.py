@@ -10,6 +10,8 @@ class DatasetConfig:
     normalization_func: Literal["max", "zero"] = "zero"
     pack_sequences: bool = False
     pack_buckets: list[int] | None = None
+    include_patterns: list[str] | None = None
+    exclude_patterns: list[str] | None = None
 
 
 @dataclass
@@ -25,6 +27,8 @@ class ModelConfig:
     k: int = 2
     n_head: int = 8
     attention_backend: str = "flash"
+    qk_norm: bool = False
+    attention_window: int | None = None
     d_ff: int | None = None
     d_expert: int | None = None
     moe_m_tile: int = 1
@@ -35,7 +39,7 @@ class ModelConfig:
 class TrainingConfig:
     model_config: ModelConfig
     epochs: int = 1
-    steps_per_epoch: int = 100_000
+    steps_per_epoch: int = 400_000
     batch_size: int = 1024
     learning_rate: float = 1e-3
     weight_decay: float = 1e-1
@@ -67,6 +71,7 @@ class TrainingConfig:
     max_wall_time_s: float | None = None
     final_val_on_budget: bool = False
     final_ckpt_on_budget: bool = True
+    compile: bool = True
     ddp: bool = False
     ddp_backend: str | None = None
     ddp_find_unused_parameters: bool = False

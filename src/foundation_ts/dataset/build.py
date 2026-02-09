@@ -17,6 +17,7 @@ def build_ts_dataset(
     pack_sequences: bool = False,
     pack_buckets: Optional[list[int]] = None,
     include_patterns: Optional[list[str]] = None,
+    exclude_patterns: Optional[list[str]] = None,
 ) -> WindowedDataset:
     """Build a windowed dataset from local files or a dataset folder."""
     normalizer = resolve_normalizer(normalization_method)
@@ -26,6 +27,7 @@ def build_ts_dataset(
         use_mmap=use_mmap,
         mmap_cache_size=mmap_cache_size,
         include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
     )
     concat_dataset = ConcatSequenceDataset(datasets)
     return WindowedDataset(

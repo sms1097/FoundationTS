@@ -231,13 +231,31 @@ def discover_sequence_datasets(
     use_mmap: bool = True,
     mmap_cache_size: int = 32,
     include_patterns: Optional[list[str]] = None,
+    exclude_patterns: Optional[list[str]] = None,
 ) -> list[SequenceDataset]:
     """Discover and load datasets from a file or directory."""
     normalized_patterns = None
     if include_patterns:
         normalized_patterns = [pattern.replace("\\", "/") for pattern in include_patterns]
+    normalized_exclude = None
+    if exclude_patterns:
+        normalized_exclude = [pattern.replace("\\", "/") for pattern in exclude_patterns]
+
+    def _is_excluded(rel_path: str, is_dir: bool) -> bool:
+        if not normalized_exclude:
+            return False
+        if any(fnmatch.fnmatch(rel_path, pattern) for pattern in normalized_exclude):
+            return True
+        if is_dir:
+            prefix = rel_path + "/"
+            for pattern in normalized_exclude:
+                if pattern.startswith(prefix):
+                    return True
+        return False
 
     def _matches_path(rel_path: str, is_dir: bool) -> bool:
+        if _is_excluded(rel_path, is_dir):
+            return False
         if not normalized_patterns:
             return True
         if any(fnmatch.fnmatch(rel_path, pattern) for pattern in normalized_patterns):

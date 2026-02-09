@@ -137,7 +137,15 @@ class RotaryEmbedding(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, backend: str = "flash"):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        backend: str = "flash",
+        qk_norm: bool = False,
+        attention_window: int | None = None,
+        qk_norm_eps: float = 1e-6,
+    ):
         super().__init__()
         assert num_heads >= 1, f"Number of attention heads must be >= 1, got {num_heads}"
         assert hidden_size % num_heads == 0, (
@@ -150,6 +158,9 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.backend = backend
+        self.qk_norm = qk_norm
+        self.qk_norm_eps = qk_norm_eps
+        self.attention_window = attention_window
         self.rotary_emb = RotaryEmbedding(self.head_dim)
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -177,6 +188,10 @@ class Attention(nn.Module):
         k = k.contiguous().view(batch_size, seq_len, self.num_heads, self.head_dim).swapaxes(1, 2)
         v = v.contiguous().view(batch_size, seq_len, self.num_heads, self.head_dim).swapaxes(1, 2)
 
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,), None, self.qk_norm_eps)
+            k = F.rms_norm(k, (self.head_dim,), None, self.qk_norm_eps)
+
         cos, sin = self.rotary_emb(q, seq_len=seq_len)
 
         # batch, seq_len, n_head, head_dim
@@ -201,7 +216,13 @@ class Attention(nn.Module):
 
             qkv = qkv.index_select(0, indices)
 
-            attn_out = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=True)
+            if self.attention_window is not None:
+                window_size = (max(1, int(self.attention_window)), 0)
+            else:
+                window_size = (-1, -1)
+            attn_out = flash_attn_varlen_qkvpacked_func(
+                qkv, cu_seqlens, max_seqlen, causal=True, window_size=window_size
+            )
             padded = torch.zeros(
                 (batch_size * seq_len, self.num_heads, self.head_dim),
                 device=attn_out.device,
@@ -210,19 +231,31 @@ class Attention(nn.Module):
             padded.index_copy_(0, indices, attn_out)
             attn_out = padded.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         else:
+            if self.attention_window is not None:
+                raise ValueError("Sliding window attention requires --attn-backend flash.")
             if segment_ids is not None:
                 raise ValueError("segment_ids are not supported with SDPA attention backend.")
             attn_mask = None
+            use_causal = True
+            if self.attention_window is not None:
+                window = max(1, int(self.attention_window))
+                idx = torch.arange(seq_len, device=hidden_state.device)
+                rel = idx[:, None] - idx[None, :]
+                window_mask = (rel < 0) | (rel >= window)
+                window_mask = window_mask[None, None, :, :]
+                attn_mask = window_mask
+                use_causal = False
             if attention_mask is not None:
                 key_padding = attention_mask == 0
                 if key_padding.any():
-                    attn_mask = key_padding[:, None, None, :]
+                    key_mask = key_padding[:, None, None, :]
+                    attn_mask = key_mask if attn_mask is None else (attn_mask | key_mask)
             attn_out = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 attn_mask=attn_mask,
-                is_causal=True,
+                is_causal=use_causal,
             )
             attn_out = attn_out.swapaxes(1, 2)
 

@@ -1,3 +1,5 @@
+import csv
+import json
 import math
 import os
 import random
@@ -108,6 +110,8 @@ def _build_dataloaders(
         normalization_method=ds_config.normalization_func,
         pack_sequences=ds_config.pack_sequences,
         pack_buckets=ds_config.pack_buckets,
+        include_patterns=ds_config.include_patterns,
+        exclude_patterns=ds_config.exclude_patterns,
     )
 
     def _make_loader(dataset, shuffle: bool, drop_last: bool) -> DataLoader:
@@ -217,6 +221,8 @@ def _build_model(model_config, device: torch.device) -> TSMOE:
         k=model_config.k,
         n_head=model_config.n_head,
         attention_backend=model_config.attention_backend,
+        qk_norm=model_config.qk_norm,
+        attention_window=model_config.attention_window,
         horizons=model_config.horizons,
         d_ff=model_config.d_ff,
         d_expert=model_config.d_expert,
@@ -311,7 +317,7 @@ def _run_validation(
     max_batches: int = 10,
     use_bf16: bool = True,
     use_amp: bool = True,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, int]:
     model.eval()
     total_pred = torch.zeros((), device=device)
     total_aux = torch.zeros((), device=device)
@@ -373,7 +379,7 @@ def _run_validation(
 
     model.train()
     if count == 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0
     if isinstance(total_count, torch.Tensor):
         total_pred = total_pred.detach().cpu()
         total_aux = total_aux.detach().cpu()
@@ -386,6 +392,7 @@ def _run_validation(
         float(total_aux) / count,
         float(total_mae) / denom,
         float(total_mse) / denom,
+        count,
     )
 
 
@@ -419,6 +426,53 @@ def _estimate_flops_per_token(active_params: int) -> float:
     return 12.0 * active_params
 
 
+def _estimate_transformer_flops_per_token(model_config, seq_len: int) -> float:
+    """Estimate forward FLOPs per model token for this architecture."""
+    hidden = model_config.hidden_size
+    n_layers = model_config.n_decoder_layers
+    n_expert_layers = model_config.num_expert_layers
+    num_experts = model_config.num_experts
+    k = model_config.k
+    d_ff = model_config.d_ff or hidden * 4
+    d_expert = model_config.d_expert or (d_ff // k)
+
+    # Attention projections: QKV + output (per token).
+    attn_proj = 8.0 * hidden * hidden
+    # Attention scores + weighted sum (per token).
+    attn_scores = 4.0 * hidden * max(1, seq_len)
+    attn_total = attn_proj + attn_scores
+
+    # MoE router + experts (per token).
+    router = 2.0 * hidden * num_experts + 2.0 * hidden
+    experts = 6.0 * hidden * d_expert * k + 6.0 * hidden * d_ff
+    moe_layer = router + experts
+
+    decoder_layer = attn_total + n_expert_layers * moe_layer
+
+    # Embedding per token: gate + emb linear.
+    input_dim = model_config.input_size
+    if model_config.patch:
+        input_dim = model_config.patch_len * model_config.input_size
+    embed = 4.0 * input_dim * hidden
+
+    # Output heads per token.
+    out = 0.0
+    for h in model_config.horizons:
+        out += 2.0 * hidden * (h * model_config.input_size)
+
+    return embed + n_layers * decoder_layer + out
+
+
+def _estimate_model_tokens_per_sequence(seq_len: int, patch: bool, patch_len: int, patch_stride: int) -> int:
+    if not patch:
+        return max(1, seq_len)
+    if patch_stride <= 0:
+        return max(1, seq_len)
+    if seq_len < patch_len:
+        return 1
+    return 1 + (seq_len - patch_len) // patch_stride
+
+
 def _format_precision(train_config, device: torch.device) -> str:
     if device.type == "cuda" and train_config.use_amp and train_config.use_bf16:
         return "bf16"
@@ -436,11 +490,29 @@ def _train_microbatches(
     autocast_dtype,
     aux_weight: float,
     ddp_no_sync: Callable[[], object] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, object]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    torch.Tensor,
+    int,
+    object,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     accum_total = torch.zeros((), device=device)
     accum_pred = torch.zeros((), device=device)
     accum_aux = torch.zeros((), device=device)
+    accum_mae = torch.zeros((), device=device)
+    accum_mse = torch.zeros((), device=device)
+    accum_count = torch.zeros((), device=device)
     accum_tokens = 0
+    accum_model_tokens = 0
+    accum_importance = None
+    accum_load = None
     for _micro in range(accum_steps):
         ctx = ddp_no_sync() if (ddp_no_sync is not None and _micro < accum_steps - 1) else nullcontext()
         with ctx:
@@ -457,6 +529,15 @@ def _train_microbatches(
                 model_config.patch_len,
                 model_config.patch_stride,
             )
+            batch_size, seq_len, _ = input_ids.shape
+            if model_config.patch:
+                if seq_len < model_config.patch_len:
+                    tokens_per_seq = 1
+                else:
+                    tokens_per_seq = 1 + (seq_len - model_config.patch_len) // model_config.patch_stride
+            else:
+                tokens_per_seq = seq_len
+            accum_model_tokens += batch_size * tokens_per_seq
 
             if autocast_dtype is None:
                 outputs, stats = model(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
@@ -486,16 +567,46 @@ def _train_microbatches(
             total_loss = pred_loss + aux_weight * aux
             (total_loss / accum_steps).backward()
 
+        if model_config.patch:
+            labels, loss_masks = _patch_labels_and_masks(
+                labels, loss_masks, model_config.patch_len, model_config.patch_stride
+            )
+        for horizon, preds in outputs.items():
+            targets, masks = _build_horizon_targets(labels, loss_masks, horizon)
+            input_size = preds.size(-1) // horizon
+            preds = preds.view(preds.size(0), preds.size(1), horizon, input_size)
+            if targets.size(-1) == 1 and input_size > 1:
+                targets = targets.expand(-1, -1, -1, input_size)
+            if masks.size(-1) == 1 and input_size > 1:
+                masks = masks.expand(-1, -1, -1, input_size)
+            diff = (preds - targets) * masks
+            accum_mae += diff.abs().sum()
+            accum_mse += (diff**2).sum()
+            accum_count += masks.sum()
+
         accum_total += total_loss.detach()
         accum_pred += pred_loss.detach()
         accum_aux += aux.detach()
         accum_tokens += input_ids.numel()
+        if stats is not None:
+            if accum_importance is None:
+                accum_importance = stats.importance.detach().clone()
+                accum_load = stats.load.detach().clone()
+            else:
+                accum_importance += stats.importance.detach()
+                accum_load += stats.load.detach()
     return (
         accum_total,
         accum_pred,
         accum_aux,
+        accum_mae,
+        accum_mse,
+        accum_model_tokens,
         accum_tokens,
+        accum_count,
         data_iter,
+        accum_importance,
+        accum_load,
     )
 
 
@@ -538,8 +649,24 @@ def train(config: RunnerConfig) -> TSMOE:
         world_size=world_size,
     )
     model = _build_model(model_config, device)
+    if train_config.compile:
+        if hasattr(torch, "compile"):
+            # Allow dynamic shapes to reduce recompiles from variable sequence/batch sizes.
+            model = torch.compile(model, dynamic=True)
+        else:
+            if _is_main_process():
+                print("torch.compile is not available; running without compilation.")
     total_params, active_params = _estimate_active_params(model)
     flops_per_token = _estimate_flops_per_token(active_params)
+    ds_config = config.dataset_config
+    est_seq_len = _estimate_model_tokens_per_sequence(
+        ds_config.seq_max_len,
+        model_config.patch,
+        model_config.patch_len,
+        model_config.patch_stride,
+    )
+    est_forward_flops_per_token = _estimate_transformer_flops_per_token(model_config, est_seq_len)
+    est_train_flops_per_token = 3.0 * est_forward_flops_per_token
     peak_flops = train_config.mfu_peak_tflops * 1e12 if train_config.mfu_peak_tflops else None
     if ddp_enabled:
         model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None,
@@ -570,16 +697,77 @@ def train(config: RunnerConfig) -> TSMOE:
     data_iter = iter(data_loader)
     last_epoch = None
     run_start = time.perf_counter()
+    metrics_path = checkpoint_dir / "train_metrics.csv"
+    metrics_file = None
+    metrics_writer = None
+    if _is_main_process():
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        file_exists = metrics_path.exists()
+        metrics_file = metrics_path.open("a", newline="")
+        fieldnames = [
+            "stage",
+            "step",
+            "loss",
+            "pred",
+            "aux",
+            "mae",
+            "mse",
+            "lr",
+            "toks_per_sec",
+            "raw_points_per_sec",
+            "model_tokens_per_sec",
+            "est_flops_per_token",
+            "est_flops_per_step",
+            "est_tflops_per_sec",
+            "mfu",
+            "step_time_ms",
+            "loss_scale",
+            "grad_norm",
+            "clip_pct",
+            "gpu_mem_allocated",
+            "gpu_mem_reserved",
+            "gpu_mem_max_allocated",
+            "gpu_mem_max_reserved",
+            "tokens_per_batch",
+            "effective_batch_size",
+            "effective_tokens",
+            "cumulative_raw_points",
+            "cumulative_model_tokens",
+            "cumulative_est_flops",
+            "load_entropy",
+            "importance_entropy",
+            "val_pred",
+            "val_aux",
+            "val_mae",
+            "val_mse",
+            "val_count",
+        ]
+        metrics_writer = csv.DictWriter(metrics_file, fieldnames=fieldnames)
+        if not file_exists:
+            metrics_writer.writeheader()
+        model_config_path = checkpoint_dir / "model_config.json"
+        if not model_config_path.exists():
+            model_config_path.write_text(
+                json.dumps(asdict(model_config), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
     deadline = None
     if train_config.max_wall_time_s is not None:
         if train_config.max_wall_time_s <= 0:
             print("max_wall_time_s <= 0, skipping training.")
+            if metrics_file is not None:
+                metrics_file.close()
             return model
         deadline = run_start + train_config.max_wall_time_s
         print(f"budget seconds={train_config.max_wall_time_s:.1f}")
     ema_step_s = None
     budget_exhausted = False
     last_global_step = start_step
+    cumulative_raw_points = 0.0
+    cumulative_model_tokens = 0.0
+    cumulative_est_flops = 0.0
     for step_idx in range(start_step, total_steps):
         if train_sampler is not None:
             epoch_idx = step_idx // train_config.steps_per_epoch
@@ -600,8 +788,14 @@ def train(config: RunnerConfig) -> TSMOE:
             accum_total,
             accum_pred,
             accum_aux,
+            accum_mae,
+            accum_mse,
+            accum_model_tokens,
             accum_tokens,
+            accum_count,
             data_iter,
+            accum_importance,
+            accum_load,
         ) = _train_microbatches(
             model,
             data_loader,
@@ -616,7 +810,12 @@ def train(config: RunnerConfig) -> TSMOE:
         )
 
         if train_config.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
+            grad_norm = float(grad_norm)
+            clip_pct = 1.0 if grad_norm > train_config.max_grad_norm else 0.0
+        else:
+            grad_norm = None
+            clip_pct = None
         optimizer.step()
         scheduler.step()
         step_end = time.perf_counter()
@@ -632,12 +831,25 @@ def train(config: RunnerConfig) -> TSMOE:
         avg_total = accum_total / accum_steps
         avg_pred = accum_pred / accum_steps
         avg_aux = accum_aux / accum_steps
+        train_denom = max(1.0, float(accum_count.detach().cpu()))
+        train_mae = float(accum_mae.detach().cpu()) / train_denom
+        train_mse = float(accum_mse.detach().cpu()) / train_denom
+        cumulative_raw_points += float(accum_tokens)
+        cumulative_model_tokens += float(accum_model_tokens)
+        cumulative_est_flops += float(est_train_flops_per_token) * float(accum_model_tokens)
 
         if _is_main_process() and train_config.log_every and global_step % train_config.log_every == 0:
             lr = optimizer.param_groups[0]["lr"]
             elapsed = max(step_end - step_start, 1e-12)
             toks_per_sec = accum_tokens / elapsed
-            mfu = (toks_per_sec * flops_per_token) / peak_flops if peak_flops else None
+            raw_points_per_sec = toks_per_sec
+            model_tokens_per_sec = accum_model_tokens / elapsed
+            est_flops_per_step = est_train_flops_per_token * accum_model_tokens
+            est_tflops_per_sec = (est_flops_per_step / elapsed) / 1e12 if elapsed > 0 else None
+            if peak_flops:
+                mfu = (model_tokens_per_sec * est_train_flops_per_token) / peak_flops
+            else:
+                mfu = None
             avg_total_val = float(avg_total)
             avg_pred_val = float(avg_pred)
             avg_aux_val = float(avg_aux)
@@ -645,8 +857,75 @@ def train(config: RunnerConfig) -> TSMOE:
             print(
                 f"step={global_step} loss={avg_total_val:.4f} "
                 f"pred={avg_pred_val:.4f} aux={avg_aux_val:.4f} "
+                f"mae={train_mae:.4f} mse={train_mse:.4f} "
                 f"lr={lr:.2e} toks/s={toks_per_sec:,.0f}{mfu_str}"
             )
+            load_entropy = None
+            importance_entropy = None
+            if accum_importance is not None and accum_load is not None:
+                imp = (accum_importance / accum_steps).detach().cpu()
+                load = (accum_load / accum_steps).detach().cpu()
+                if imp.numel() > 0:
+                    imp_p = imp / (imp.sum() + 1e-12)
+                    load_p = load / (load.sum() + 1e-12)
+                    norm = math.log(imp_p.numel())
+                    if norm > 0:
+                        importance_entropy = float(-(imp_p * (imp_p + 1e-12).log()).sum() / norm)
+                        load_entropy = float(-(load_p * (load_p + 1e-12).log()).sum() / norm)
+            if metrics_writer is not None:
+                gpu_mem_alloc = None
+                gpu_mem_res = None
+                if device.type == "cuda":
+                    gpu_mem_alloc = float(torch.cuda.memory_allocated(device))
+                    gpu_mem_res = float(torch.cuda.memory_reserved(device))
+                    gpu_mem_max_alloc = float(torch.cuda.max_memory_allocated(device))
+                    gpu_mem_max_res = float(torch.cuda.max_memory_reserved(device))
+                else:
+                    gpu_mem_max_alloc = None
+                    gpu_mem_max_res = None
+                tokens_per_batch = accum_tokens / max(1, accum_steps)
+                effective_batch_size = train_config.batch_size * accum_steps
+                metrics_writer.writerow(
+                    {
+                        "stage": "train",
+                        "step": global_step,
+                        "loss": avg_total_val,
+                        "pred": avg_pred_val,
+                        "aux": avg_aux_val,
+                        "mae": train_mae,
+                        "mse": train_mse,
+                        "lr": lr,
+                        "toks_per_sec": toks_per_sec,
+                        "raw_points_per_sec": raw_points_per_sec,
+                        "model_tokens_per_sec": model_tokens_per_sec,
+                        "est_flops_per_token": est_train_flops_per_token,
+                        "est_flops_per_step": est_flops_per_step,
+                        "est_tflops_per_sec": est_tflops_per_sec,
+                        "mfu": None if mfu is None else mfu * 100.0,
+                        "step_time_ms": step_time * 1000.0,
+                        "loss_scale": None,
+                        "grad_norm": grad_norm,
+                        "clip_pct": clip_pct,
+                        "gpu_mem_allocated": gpu_mem_alloc,
+                        "gpu_mem_reserved": gpu_mem_res,
+                        "gpu_mem_max_allocated": gpu_mem_max_alloc,
+                        "gpu_mem_max_reserved": gpu_mem_max_res,
+                        "tokens_per_batch": tokens_per_batch,
+                        "effective_batch_size": effective_batch_size,
+                        "effective_tokens": accum_tokens,
+                        "cumulative_raw_points": cumulative_raw_points,
+                        "cumulative_model_tokens": cumulative_model_tokens,
+                        "cumulative_est_flops": cumulative_est_flops,
+                        "load_entropy": load_entropy,
+                        "importance_entropy": importance_entropy,
+                        "val_pred": None,
+                        "val_aux": None,
+                        "val_mae": None,
+                        "val_mse": None,
+                        "val_count": None,
+                    }
+                )
+                metrics_file.flush()
 
         if deadline is not None and step_end >= deadline:
             if _is_main_process():
@@ -656,7 +935,7 @@ def train(config: RunnerConfig) -> TSMOE:
 
         if _is_main_process() and train_config.val_every and global_step % train_config.val_every == 0:
             if val_loader is not None:
-                val_pred, val_aux, val_mae, val_mse = _run_validation(
+                val_pred, val_aux, val_mae, val_mse, val_count = _run_validation(
                     model,
                     val_loader,
                     device,
@@ -672,8 +951,50 @@ def train(config: RunnerConfig) -> TSMOE:
                     f"val step={global_step} pred={val_pred:.4f} aux={val_aux:.4f} "
                     f"mae={val_mae:.4f} mse={val_mse:.4f}"
                 )
+                if metrics_writer is not None:
+                    metrics_writer.writerow(
+                        {
+                            "stage": "val",
+                            "step": global_step,
+                            "loss": None,
+                            "pred": None,
+                            "aux": None,
+                            "mae": None,
+                            "mse": None,
+                            "lr": None,
+                            "toks_per_sec": None,
+                            "raw_points_per_sec": None,
+                            "model_tokens_per_sec": None,
+                            "est_flops_per_token": None,
+                            "est_flops_per_step": None,
+                            "est_tflops_per_sec": None,
+                            "mfu": None,
+                            "step_time_ms": None,
+                            "loss_scale": None,
+                            "grad_norm": None,
+                            "clip_pct": None,
+                            "gpu_mem_allocated": None,
+                            "gpu_mem_reserved": None,
+                            "gpu_mem_max_allocated": None,
+                            "gpu_mem_max_reserved": None,
+                            "tokens_per_batch": None,
+                            "effective_batch_size": None,
+                            "effective_tokens": None,
+                            "cumulative_raw_points": cumulative_raw_points,
+                            "cumulative_model_tokens": cumulative_model_tokens,
+                            "cumulative_est_flops": cumulative_est_flops,
+                            "load_entropy": None,
+                            "importance_entropy": None,
+                            "val_pred": val_pred,
+                            "val_aux": val_aux,
+                            "val_mae": val_mae,
+                            "val_mse": val_mse,
+                            "val_count": val_count,
+                        }
+                    )
+                    metrics_file.flush()
             if ood_val_loader is not None:
-                ood_pred, ood_aux, ood_mae, ood_mse = _run_validation(
+                ood_pred, ood_aux, ood_mae, ood_mse, ood_count = _run_validation(
                     model,
                     ood_val_loader,
                     device,
@@ -689,13 +1010,55 @@ def train(config: RunnerConfig) -> TSMOE:
                     f"val_ood step={global_step} pred={ood_pred:.4f} aux={ood_aux:.4f} "
                     f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
                 )
+                if metrics_writer is not None:
+                    metrics_writer.writerow(
+                        {
+                            "stage": "val_ood",
+                            "step": global_step,
+                            "loss": None,
+                            "pred": None,
+                            "aux": None,
+                            "mae": None,
+                            "mse": None,
+                            "lr": None,
+                            "toks_per_sec": None,
+                            "raw_points_per_sec": None,
+                            "model_tokens_per_sec": None,
+                            "est_flops_per_token": None,
+                            "est_flops_per_step": None,
+                            "est_tflops_per_sec": None,
+                            "mfu": None,
+                            "step_time_ms": None,
+                            "loss_scale": None,
+                            "grad_norm": None,
+                            "clip_pct": None,
+                            "gpu_mem_allocated": None,
+                            "gpu_mem_reserved": None,
+                            "gpu_mem_max_allocated": None,
+                            "gpu_mem_max_reserved": None,
+                            "tokens_per_batch": None,
+                            "effective_batch_size": None,
+                            "effective_tokens": None,
+                            "cumulative_raw_points": cumulative_raw_points,
+                            "cumulative_model_tokens": cumulative_model_tokens,
+                            "cumulative_est_flops": cumulative_est_flops,
+                            "load_entropy": None,
+                            "importance_entropy": None,
+                            "val_pred": ood_pred,
+                            "val_aux": ood_aux,
+                            "val_mae": ood_mae,
+                            "val_mse": ood_mse,
+                            "val_count": ood_count,
+                        }
+                    )
+                    metrics_file.flush()
 
         if _is_main_process() and train_config.checkpoint_every and global_step % train_config.checkpoint_every == 0:
             _save_checkpoint(checkpoint_dir, global_step, model, optimizer, scheduler, model_config)
     if budget_exhausted:
         if _is_main_process() and train_config.final_val_on_budget:
             if val_loader is not None:
-                val_pred, val_aux, val_mae, val_mse = _run_validation(
+                val_pred, val_aux, val_mae, val_mse, val_count = _run_validation(
                     model,
                     val_loader,
                     device,
@@ -711,8 +1074,50 @@ def train(config: RunnerConfig) -> TSMOE:
                     f"val step={last_global_step} pred={val_pred:.4f} aux={val_aux:.4f} "
                     f"mae={val_mae:.4f} mse={val_mse:.4f}"
                 )
+                if metrics_writer is not None:
+                    metrics_writer.writerow(
+                        {
+                            "stage": "val_budget",
+                            "step": last_global_step,
+                            "loss": None,
+                            "pred": None,
+                            "aux": None,
+                            "mae": None,
+                            "mse": None,
+                            "lr": None,
+                            "toks_per_sec": None,
+                            "raw_points_per_sec": None,
+                            "model_tokens_per_sec": None,
+                            "est_flops_per_token": None,
+                            "est_flops_per_step": None,
+                            "est_tflops_per_sec": None,
+                            "mfu": None,
+                            "step_time_ms": None,
+                            "loss_scale": None,
+                            "grad_norm": None,
+                            "clip_pct": None,
+                            "gpu_mem_allocated": None,
+                            "gpu_mem_reserved": None,
+                            "gpu_mem_max_allocated": None,
+                            "gpu_mem_max_reserved": None,
+                            "tokens_per_batch": None,
+                            "effective_batch_size": None,
+                            "effective_tokens": None,
+                            "cumulative_raw_points": cumulative_raw_points,
+                            "cumulative_model_tokens": cumulative_model_tokens,
+                            "cumulative_est_flops": cumulative_est_flops,
+                            "load_entropy": None,
+                            "importance_entropy": None,
+                            "val_pred": val_pred,
+                            "val_aux": val_aux,
+                            "val_mae": val_mae,
+                            "val_mse": val_mse,
+                            "val_count": val_count,
+                        }
+                    )
+                    metrics_file.flush()
             if ood_val_loader is not None:
-                ood_pred, ood_aux, ood_mae, ood_mse = _run_validation(
+                ood_pred, ood_aux, ood_mae, ood_mse, ood_count = _run_validation(
                     model,
                     ood_val_loader,
                     device,
@@ -728,9 +1133,53 @@ def train(config: RunnerConfig) -> TSMOE:
                     f"val_ood step={last_global_step} pred={ood_pred:.4f} aux={ood_aux:.4f} "
                     f"mae={ood_mae:.4f} mse={ood_mse:.4f}"
                 )
+                if metrics_writer is not None:
+                    metrics_writer.writerow(
+                        {
+                            "stage": "val_ood_budget",
+                            "step": last_global_step,
+                            "loss": None,
+                            "pred": None,
+                            "aux": None,
+                            "mae": None,
+                            "mse": None,
+                            "lr": None,
+                            "toks_per_sec": None,
+                            "raw_points_per_sec": None,
+                            "model_tokens_per_sec": None,
+                            "est_flops_per_token": None,
+                            "est_flops_per_step": None,
+                            "est_tflops_per_sec": None,
+                            "mfu": None,
+                            "step_time_ms": None,
+                            "loss_scale": None,
+                            "grad_norm": None,
+                            "clip_pct": None,
+                            "gpu_mem_allocated": None,
+                            "gpu_mem_reserved": None,
+                            "gpu_mem_max_allocated": None,
+                            "gpu_mem_max_reserved": None,
+                            "tokens_per_batch": None,
+                            "effective_batch_size": None,
+                            "effective_tokens": None,
+                            "cumulative_raw_points": cumulative_raw_points,
+                            "cumulative_model_tokens": cumulative_model_tokens,
+                            "cumulative_est_flops": cumulative_est_flops,
+                            "load_entropy": None,
+                            "importance_entropy": None,
+                            "val_pred": ood_pred,
+                            "val_aux": ood_aux,
+                            "val_mae": ood_mae,
+                            "val_mse": ood_mse,
+                            "val_count": ood_count,
+                        }
+                    )
+                    metrics_file.flush()
         if _is_main_process() and train_config.final_ckpt_on_budget and last_global_step > 0:
             _save_checkpoint(checkpoint_dir, last_global_step, model, optimizer, scheduler, model_config)
     if ddp_enabled and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+    if metrics_file is not None:
+        metrics_file.close()
     return model

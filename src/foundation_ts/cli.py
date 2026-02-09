@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -39,6 +40,8 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--normalization-func", choices=["max", "zero"], default="zero")
     parser.add_argument("--pack-sequences", action="store_true")
     parser.add_argument("--pack-buckets", default=None)
+    parser.add_argument("--train-partitions", default=None)
+    parser.add_argument("--no-exclude-validation-partitions", action="store_true")
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
@@ -50,6 +53,8 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--k", type=int, default=2)
     parser.add_argument("--n-head", type=int, default=8)
     parser.add_argument("--attn-backend", choices=["flash", "sdpa"], default="flash")
+    parser.add_argument("--attn-window", type=int, default=None)
+    parser.add_argument("--qk-norm", action="store_true")
     parser.add_argument("--d-ff", type=int, default=None)
     parser.add_argument("--d-expert", type=int, default=None)
     parser.add_argument("--moe-m-tile", type=int, default=1)
@@ -67,8 +72,10 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
 def _add_train_args(parser: argparse.ArgumentParser) -> None:
     _add_model_args(parser)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--steps-per-epoch", type=int, default=100_000)
+    parser.add_argument("--steps-per-epoch", type=int, default=400_000)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--microbatch-size", type=int, default=None)
+    parser.add_argument("--global-batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-1)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -86,11 +93,13 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--val-every", type=int, default=1000)
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--run-name", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--mfu-peak-tflops", type=float, default=None)
     parser.add_argument("--max-wall-time-s", type=float, default=None)
     parser.add_argument("--final-val-on-budget", action="store_true")
     parser.add_argument("--no-final-ckpt-on-budget", action="store_true")
+    parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--ddp-backend", default=None)
     parser.add_argument("--ddp-find-unused-parameters", action="store_true")
@@ -117,6 +126,13 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
     pack_buckets = None
     if args.pack_buckets:
         pack_buckets = [int(item) for item in args.pack_buckets.split(",") if item.strip()]
+    train_partitions = None
+    if args.train_partitions:
+        train_partitions = [p.strip() for p in args.train_partitions.split(",") if p.strip()]
+        if not train_partitions:
+            raise ValueError("--train-partitions provided but empty after parsing.")
+    exclude_validation_partitions = not args.no_exclude_validation_partitions
+    exclude_patterns = VALIDATION_SET if exclude_validation_partitions else None
     dataset_config = DatasetConfig(
         dataset_path=args.dataset_path,
         seq_max_len=args.seq_max_len,
@@ -124,6 +140,8 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         normalization_func=args.normalization_func,
         pack_sequences=args.pack_sequences,
         pack_buckets=pack_buckets,
+        include_patterns=train_partitions,
+        exclude_patterns=exclude_patterns,
     )
     model_config = ModelConfig(
         hidden_size=args.hidden_size,
@@ -137,6 +155,8 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         k=args.k,
         n_head=args.n_head,
         attention_backend=args.attn_backend,
+        qk_norm=args.qk_norm,
+        attention_window=args.attn_window,
         d_ff=args.d_ff,
         d_expert=args.d_expert,
         moe_m_tile=args.moe_m_tile,
@@ -150,11 +170,28 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
     if ood_val_partitions and not ood_val_dataset_path:
         ood_val_dataset_path = args.dataset_path
 
+    batch_size = args.batch_size
+    if args.microbatch_size is not None:
+        if args.batch_size != 1024:
+            raise ValueError("Use either --batch-size or --microbatch-size, not both.")
+        batch_size = args.microbatch_size
+    grad_accum_steps = args.grad_accum_steps
+    if args.global_batch_size is not None:
+        if args.grad_accum_steps != 1:
+            raise ValueError("Use either --grad-accum-steps or --global-batch-size, not both.")
+        if batch_size <= 0:
+            raise ValueError("--microbatch-size/--batch-size must be > 0 when using --global-batch-size.")
+        if args.global_batch_size % batch_size != 0:
+            raise ValueError(
+                "--global-batch-size must be divisible by --microbatch-size/--batch-size."
+            )
+        grad_accum_steps = args.global_batch_size // batch_size
+
     train_config = TrainingConfig(
         model_config=model_config,
         epochs=args.epochs,
         steps_per_epoch=args.steps_per_epoch,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         beta1=args.beta1,
@@ -162,7 +199,7 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         aux_loss_weight=args.aux_loss_weight,
         max_grad_norm=args.max_grad_norm,
         warmup_steps=args.warmup_steps,
-        grad_accum_steps=args.grad_accum_steps,
+        grad_accum_steps=grad_accum_steps,
         device=args.device,
         use_amp=not args.no_amp,
         use_bf16=not args.no_bf16,
@@ -174,12 +211,16 @@ def _build_train_config(args: argparse.Namespace) -> RunnerConfig:
         log_every=args.log_every,
         val_every=args.val_every,
         checkpoint_every=args.checkpoint_every,
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=str(
+            Path(args.checkpoint_dir)
+            / (args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S"))
+        ),
         resume_from_checkpoint=args.resume_checkpoint,
         mfu_peak_tflops=args.mfu_peak_tflops,
         max_wall_time_s=args.max_wall_time_s,
         final_val_on_budget=args.final_val_on_budget,
         final_ckpt_on_budget=not args.no_final_ckpt_on_budget,
+        compile=not args.no_compile,
         ddp=args.ddp,
         ddp_backend=args.ddp_backend,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,

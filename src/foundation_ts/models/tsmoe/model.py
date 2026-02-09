@@ -71,6 +71,8 @@ class MOEDecoderLayer(nn.Module):
         n_head: int,
         k: int,
         attention_backend: str = "flash",
+        qk_norm: bool = False,
+        attention_window: int | None = None,
         d_ff: int | None = None,
         d_expert: int | None = None,
         moe_m_tile: int = 1,
@@ -79,7 +81,13 @@ class MOEDecoderLayer(nn.Module):
         self.num_experts = num_experts
         self.rms_norm1 = RMSNorm(hidden_size)
 
-        self.attention = Attention(hidden_size, n_head, backend=attention_backend)
+        self.attention = Attention(
+            hidden_size,
+            n_head,
+            backend=attention_backend,
+            qk_norm=qk_norm,
+            attention_window=attention_window,
+        )
         self.rms_norm2 = RMSNorm(hidden_size)
         self.expert_layers = nn.ModuleList(
             [
@@ -134,6 +142,8 @@ class TSMOE(nn.Module):
         patch_len: int = 32,
         patch_stride: int = 32,
         attention_backend: str = "flash",
+        qk_norm: bool = False,
+        attention_window: int | None = None,
         d_ff: int | None = None,
         d_expert: int | None = None,
         moe_m_tile: int = 128,
@@ -150,6 +160,8 @@ class TSMOE(nn.Module):
                 n_head,
                 k,
                 attention_backend=attention_backend,
+                qk_norm=qk_norm,
+                attention_window=attention_window,
                 d_ff=d_ff,
                 d_expert=d_expert,
                 moe_m_tile=moe_m_tile,
